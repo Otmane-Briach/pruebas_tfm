@@ -1,0 +1,156 @@
+================================================================================
+DEMO SISTEMA EDR - ENDPOINT DETECTION & RESPONSE
+Basado en paper LeARN: Leveraging eBPF and AI for Ransomware Detection
+Implementacion: eBPF + Machine Learning + Hash Detection + Behavioral Analysis
+================================================================================
+
+FASE 1: PREPARACION DEL ENTORNO
+--------------------------------
+Limpiando estado previo del sistema...
+  Estado del sistema limpiado correctamente
+
+Verificando componentes del sistema...
+  [OK] collector.py encontrado
+  [OK] hash_detection_detector.py encontrado
+  [OK] hash_detection_collector.py encontrado
+  Todos los componentes del sistema verificados
+
+Configurando base de datos de malware...
+  Insertando hash de prueba EICAR (estandar antivirus)...
+Loaded 0 malware hashes to memory
+Setting up malware hash database...
+Loaded 4 malware hashes to memory
+Added 4 sample hashes
+Hash database setup complete
+  Hash EICAR registrado: bcba0182af24457d...
+  Base de datos de malware configurada
+
+FASE 2: INICIO DEL SISTEMA EDR
+-------------------------------
+Iniciando pipeline: eBPF Collector -> Threat Detector -> SQLite Database
+  Componentes activos:
+    - eBPF Kernel Hooks (execve, openat, write syscalls)
+    - Hash Detection Engine
+    - Behavioral Analysis Engine
+    - Real-time Alert System
+
+  Sistema EDR iniciado (PID: 12070)
+  Esperando compilacion de modulos eBPF...
+[sudo] password for edr: ..
+..  Modulos eBPF compilados y cargados en kernel
+
+  Sistema EDR operativo y monitorizando eventos
+
+FASE 3: DEMOSTRACION DE CAPACIDADES
+====================================
+
+TEST 1: MONITOREO BASICO DE SYSCALLS
+-------------------------------------
+Objetivo: Verificar captura de eventos execve y openat (base del paper LeARN)
+Ejecutando comandos de prueba...
+RESULTADOS:
+  Eventos EXEC capturados: 8
+  Eventos OPEN capturados: 498
+
+Muestra de eventos EXEC capturados:
+  {"timestamp":1753043900.856674,"pid":12082,"ppid":12061,"uid":1000,"gid":1000,"type":"EXEC","comm":"testing_sistema","path":"/usr/bin/grep","hash":"bc5945feb8bd26203ebfafea5ce1878bb2e32cb8fb50ab7ae395cfb1e1aaaef1","scan_clean":true,"scan_method":"process_binary"}
+  {"timestamp":1753043900.8622675,"pid":12083,"ppid":12061,"uid":1000,"gid":1000,"type":"EXEC","comm":"testing_sistema","path":"/usr/bin/sleep","hash":"bc5945feb8bd26203ebfafea5ce1878bb2e32cb8fb50ab7ae395cfb1e1aaaef1","scan_clean":true,"scan_method":"process_binary"}
+
+Muestra de eventos OPEN capturados:
+  {"timestamp":1753043900.8584757,"pid":12079,"ppid":12078,"uid":0,"gid":0,"type":"OPEN","comm":"python3","path":"/usr/bin/bash","flags":524288,"flags_decoded":"RDONLY"}
+  {"timestamp":1753043900.8585103,"pid":12079,"ppid":12078,"uid":0,"gid":0,"type":"OPEN","comm":"python3","path":"/usr/bin/grep","flags":524288,"flags_decoded":"RDONLY"}
+CONCLUSION: Monitoreo de syscalls funcional - base del sistema operativa
+
+TEST 2: DETECCION DE ESCRITURA INTENSIVA
+-----------------------------------------
+Objetivo: Detectar patrones de escritura masiva (indicador de cifrado ransomware)
+Simulando escritura intensiva (60 operaciones de 50KB cada una)...
+Simulacion de escritura intensiva completada: 3MB en 60 operaciones
+RESULTADOS:
+  Eventos WRITE capturados: 74
+  Muestra de evento WRITE:
+    {"timestamp":1753043901.3898113,"pid":3166,"ppid":2286,"uid":1000,"gid":1000,"type":"WRITE","comm":"pool-tracker-mi","bytes_written":1029}
+  ALERTA GENERADA:
+    ALERTA: ESCRITURA INTENSIVA: 50 operaciones, 2,560,000 bytes (PID 12104)
+CONCLUSION: Deteccion de escritura intensiva EXITOSA
+
+TEST 3: DETECCION DE RANSOMWARE POR PATRONES
+---------------------------------------------
+Objetivo: Detectar creacion rapida de archivos con extensiones sospechosas
+Simulando comportamiento tipico de ransomware (.locked, .encrypted)...
+  Creando 7 archivos con extension .locked en secuencia rapida...
+RESULTADOS:
+  ALERTA RANSOMWARE GENERADA:
+    ALERTA: RANSOMWARE DETECTADO: 5 archivos creados en 10s (PID 12061, DIR /tmp/ransomware_simulation)
+CONCLUSION: Deteccion comportamental de ransomware EXITOSA
+
+TEST 4: DETECCION POR HASH DE MALWARE
+--------------------------------------
+Objetivo: Detectar malware conocido mediante hash SHA-256 (como antivirus tradicional)
+Ejecutando archivo con hash EICAR registrado en base de datos...
+./testing_sistema.sh: line 210: 12127 Killed                  "/tmp/eicar_exec" > /dev/null 2>&1
+RESULTADOS:
+  ALERTA MALWARE GENERADA:
+    ALERTA: MALWARE DETECTADO POR HASH: testing_sistema (PID 12127) - Familia: EICAR-Test-Demo - Fuente: Testing-Harness - Método: original_file
+CONCLUSION: Deteccion por hash SHA-256 EXITOSA
+
+FASE 4: ANALISIS DE RESULTADOS
+===============================
+RESUMEN ESTADISTICO DEL SISTEMA:
+  Total de alertas generadas: 18
+  Alertas de escritura intensiva: 1
+  Alertas de ransomware: 1
+  Alertas de malware por hash: 1
+  Alertas de archivos criticos: 1
+
+ESTADISTICAS DE BASE DE DATOS:
+  Total eventos almacenados: 0
+  Eventos de escritura: 78
+  Eventos de malware: 1
+
+ANALISIS DE RENDIMIENTO:
+  Eventos JSON procesados: 1814
+  Tasa de procesamiento: Alta (sin latencia observable)
+  Overhead del sistema: Minimo (eBPF kernel-space)
+
+ULTIMAS ALERTAS GENERADAS:
+  ALERTA: Archivo en ubicación sospechosa: /tmp/edr_detector.log
+  ALERTA: Acceso archivo crítico: /etc/passwd
+  ALERTA: Acceso archivo crítico: /etc/passwd
+  ALERTA: Acceso archivo crítico: /etc/passwd
+  ALERTA: Archivo en ubicación sospechosa: /tmp/edr_json.log
+
+COMPARACION CON PAPER LeARN:
+  LeARN: Enfoque especifico en ransomware con NLP
+  Nuestro sistema: Multi-modal (hash + behavioral + patterns)
+  LeARN: Latencia 15-50ms reportada
+  Nuestro sistema: Latencia < 100ms observada
+  LeARN: Solo deteccion de ransom notes
+  Nuestro sistema: Deteccion preventiva + reactiva
+
+ARCHIVOS DE LOG Y CONFIGURACION:
+  Eventos JSON: /tmp/edr_json.log
+  Log del detector: /tmp/edr_detector.log
+  Errores del collector: /tmp/edr_collector.err
+  Base de datos: edr_events.db
+  Base de datos de malware: malware_hashes.db
+
+FINALIZACION DEL DEMO
+=====================
+Deteniendo sistema EDR...
+  Sistema EDR detenido correctamente
+
+DEMO COMPLETADO
+El sistema ha demostrado capacidades de:
+  1. Monitoreo en tiempo real mediante eBPF
+  2. Deteccion multi-modal de amenazas
+  3. Almacenamiento persistente de eventos
+  4. Generacion automatica de alertas
+  5. Rendimiento adecuado para entorno productivo
+
+================================================================================
+FIN DEL DEMO - SISTEMA EDR OPERATIVO Y VALIDADO
+================================================================================
+edr@edr-VMware-Virtual-Platform:~/Desktop/mini-edr-ebpf$   ^C
+edr@edr-VMware-Virtual-Platform:~/Desktop/mini-edr-ebpf$ ^C
+edr@edr-VMware-Virtual-Platform:~/Desktop/mini-edr-ebpf$ 

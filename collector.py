@@ -93,7 +93,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     u64 uid_gid = bpf_get_current_uid_gid();
     data.uid = uid_gid & 0xFFFFFFFF;
     data.gid = uid_gid >> 32;
-    bpf_get_current_comm(&data.comm, sizeof(data.comm)); #nombre del proceso que esta ejecutando la syscall
+    bpf_get_current_comm(&data.comm, sizeof(data.comm)); nombre del proceso que esta ejecutando la syscall
     bpf_probe_read_user_str(&data.filename, sizeof(data.filename), (void*)args->filename);#ruta del archivo que se le pasa como argumento a la syscall
     events.perf_submit(args, &data, sizeof(data));
     return 0;
@@ -403,7 +403,7 @@ def main():
             except: 
                 pass
         if args.verbose:
-            print(f"\n📊 Estadísticas finales:", file=sys.stderr)
+            print(f"\nEstadísticas finales:", file=sys.stderr)
             print(f"   WRITE: {write_event_count} eventos, {total_write_bytes} bytes", file=sys.stderr)
             print(f"   UNLINK: {unlink_event_count} archivos borrados", file=sys.stderr)
             print(f"   CHMOD: {chmod_event_count} cambios de permisos", file=sys.stderr)

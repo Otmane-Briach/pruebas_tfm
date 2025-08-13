@@ -1,541 +1,325 @@
 #!/bin/bash
-# testing_sistema.sh  
- 
+# test_new_syscalls.sh - Validación de nuevas syscalls (unlink/chmod)
 
 set -u
-umask 022
 
-echo "================================================================================"
-echo "                    EDR SYSTEM PROFESSIONAL DEMONSTRATION                      "
-echo "================================================================================"
+echo "================================================"
+echo "    TEST DE NUEVAS SYSCALLS - UNLINK & CHMOD   "
+echo "================================================"
 echo
 
-# Configuration variables
-DEMO_DIR="/tmp/edr_demo_$(date +%s)"
-LOG_FILE="/tmp/edr_system.log"
-TEST_DURATION=25
-JSON_LOG="/tmp/edr_json.log"
-DET_LOG="/tmp/edr_detector.log"
-COLL_ERR="/tmp/edr_collector.err"
-DB="edr_events.db"
+# Colores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# Cleanup previous state
-echo "PHASE 1: ENVIRONMENT PREPARATION"
-echo "================================="
-echo
-echo "-> Cleaning previous system state..."
-rm -f "$JSON_LOG" "$DET_LOG" "$COLL_ERR" "$DB" malware_hashes.db "$LOG_FILE"
-rm -rf /tmp/edr_demo_* /tmp/test_* /tmp/eicar_* /tmp/malware_*
-killall nc python3 curl wget 2>/dev/null || true
+# Directorio de pruebas
+TEST_DIR="/tmp/edr_syscall_test_$(date +%s)"
+mkdir -p "$TEST_DIR"
+
+# Limpiar procesos previos
+echo "🧹 Limpiando estado previo..."
 pkill -f collector.py 2>/dev/null || true
-pkill -f hash_detection_detector.py 2>/dev/null || true
-echo "   System state cleaned successfully"
+rm -f /tmp/syscall_test.log /tmp/syscall_test.err
+sleep 2
+
+# Iniciar collector expandido
+echo "🚀 Iniciando EDR con syscalls expandidas..."
+echo "   Monitorizando: EXEC, OPEN, WRITE, UNLINK, CHMOD"
 echo
 
-echo "-> Verifying system components..."
-REQUIRED_FILES=("collector.py" "hash_detection_collector.py" "hash_detection_detector.py")
-COMPONENTS_OK=true
-
-for file in "${REQUIRED_FILES[@]}"; do
-    if [ -f "$file" ]; then
-        echo "   [OK] $file found"
-    else
-        echo "   [ERROR] Missing component: $file"
-        COMPONENTS_OK=false
-    fi
-done
-
-if [ "$COMPONENTS_OK" = false ]; then
-    echo "   ERROR: Missing components detected. Aborting demonstration."
-    exit 1
-fi
-echo "   All system components verified successfully"
-echo
-
-echo "-> Configuring threat intelligence database..."
-echo "   Downloading malware signatures from MalwareBazaar..."
-
-python3 -c "
-from hash_detection_collector import HashDetectionEngine
-import time
-
-print('   Initializing threat intelligence engine...')
-start_time = time.time()
-
-engine = HashDetectionEngine()
-engine.setup_database(download_real=True)
-
-download_time = time.time() - start_time
-stats = engine.get_statistics()
-
-print(f'   Download completed in {download_time:.1f} seconds')
-print(f'   Threat signatures loaded: {stats[\"hash_database_size\"]:,}')
-"
-
-# Verify database creation
-if [ -f "malware_hashes.db" ]; then
-    TOTAL_HASHES=$(sqlite3 malware_hashes.db "SELECT COUNT(*) FROM malware_hashes;" 2>/dev/null || echo "0")
-    echo "   Database status: $TOTAL_HASHES signatures loaded"
-    echo "   Threat intelligence configuration: COMPLETE"
-else
-    echo "   ERROR: Threat intelligence database not created"
-    exit 1
-fi
-
-echo
-echo "PHASE 2: MALWARE SAMPLE PREPARATION"
-echo "===================================="
-echo
-
-mkdir -p "$DEMO_DIR"
-
-echo "-> Creating EICAR test sample with executable wrapper..."
-EICAR_FILE="$DEMO_DIR/malware_sample.sh"
-
-# Create EICAR with proper shebang for real execution
-cat > "$EICAR_FILE" << 'EOF'
-#!/bin/bash
-# EICAR Test File - Industry standard antivirus test sample
-X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*
-EOF
-
-chmod +x "$EICAR_FILE"
-
-EICAR_HASH=$(sha256sum "$EICAR_FILE" | cut -d' ' -f1)
-echo "   Sample created: $EICAR_FILE"
-echo "   SHA-256 hash: $EICAR_HASH"
-
-echo "-> Registering EICAR sample in threat database..."
-sqlite3 malware_hashes.db "INSERT OR REPLACE INTO malware_hashes (sha256, family, source) VALUES ('$EICAR_HASH', 'EICAR-Test-Professional', 'Demo-System');"
-
-# Verify registration
-EICAR_IN_DB=$(sqlite3 malware_hashes.db "SELECT COUNT(*) FROM malware_hashes WHERE sha256='$EICAR_HASH';" 2>/dev/null || echo "0")
-if [ "$EICAR_IN_DB" -gt "0" ]; then
-    echo "   EICAR sample confirmed in threat database"
-    echo "   Detection capability: VERIFIED"
-else
-    echo "   ERROR: Failed to register EICAR sample"
-    exit 1
-fi
-
-echo "-> Creating additional malware samples for comprehensive testing..."
-MALWARE2_FILE="$DEMO_DIR/crypto_ransomware.exe"
-echo "This is a simulated crypto ransomware for system testing" > "$MALWARE2_FILE"
-chmod +x "$MALWARE2_FILE"
-
-MALWARE2_HASH=$(sha256sum "$MALWARE2_FILE" | cut -d' ' -f1)
-sqlite3 malware_hashes.db "INSERT OR REPLACE INTO malware_hashes (sha256, family, source) VALUES ('$MALWARE2_HASH', 'CryptoLocker-Simulation', 'Demo-System');"
-
-echo "   Malware test samples prepared:"
-echo "      Primary (EICAR): $EICAR_HASH"
-echo "      Secondary (CryptoLocker): $MALWARE2_HASH"
-echo "   Sample preparation: COMPLETE"
-
-echo
-echo "PHASE 3: EDR SYSTEM INITIALIZATION"
-echo "==================================="
-echo
-
-echo "-> Starting EDR system with enhanced capabilities..."
-echo "   Active components:"
-echo "      * eBPF kernel-space monitoring (execve, openat, write syscalls)"
-echo "      * Dual hash detection engine (process + original file scanning)"
-echo "      * Behavioral analysis engine with anti-spam"
-echo "      * SQLite persistence layer"
-echo "      * Real-time threat termination"
-
-echo "   Component verification:"
-echo "      * collector.py (eBPF + dual hash scanning)"
-echo "      * hash_detection_detector.py (behavioral analysis + persistence)"
-echo "      * hash_detection_collector.py (enhanced dual scan engine)"
-
-# Start EDR system with enhanced components
-sudo python3 collector.py --verbose --download-hashes 2>"$COLL_ERR" \
- | tee "$JSON_LOG" \
- | python3 hash_detection_detector.py >"$DET_LOG" 2>&1 &
+sudo python3 collector.py --verbose 2>/tmp/syscall_test.err | tee /tmp/syscall_test.log &
 EDR_PID=$!
 
-echo "   EDR system initiated (Process ID: $EDR_PID)"
-echo "   Log files:"
-echo "      * JSON events: $JSON_LOG"
-echo "      * Detection log: $DET_LOG"
-echo "      * System errors: $COLL_ERR"
+# Esperar compilación eBPF
+echo "⏳ Esperando compilación eBPF..."
+sleep 5
 
-echo "   Waiting for eBPF module compilation and system stabilization..."
-
-# Wait for eBPF compilation
-for i in {1..15}; do
-    if grep -q "Compilando\|Monitorizando" "$COLL_ERR" 2>/dev/null; then
-        echo "   eBPF modules compiled and loaded into kernel"
-        break
-    fi
-    sleep 1
-    echo -n "."
-done
-echo
-
-sleep 3
-
-# Verify EDR is running
-if kill -0 $EDR_PID 2>/dev/null; then
-    echo "   EDR system status: OPERATIONAL"
-    echo "   Monitoring active: Real-time syscall interception"
-else
-    echo "   ERROR: EDR system failed to initialize"
-    echo "   Diagnostic information:"
-    cat "$COLL_ERR"
+if ! kill -0 $EDR_PID 2>/dev/null; then
+    echo -e "${RED}❌ Error: EDR no pudo iniciar${NC}"
+    cat /tmp/syscall_test.err
     exit 1
 fi
 
-echo
-echo "PHASE 4: MALWARE DETECTION VALIDATION"
-echo "======================================"
+echo -e "${GREEN}✓ EDR iniciado correctamente (PID: $EDR_PID)${NC}"
 echo
 
-echo "TEST 4.1: Hash-based malware detection"
-echo "---------------------------------------"
-echo "Objective: Validate immediate detection and termination of known malware"
-echo "Method: Execute EICAR sample with registered hash signature"
+# ======================
+# TEST 1: UNLINK BÁSICO
+# ======================
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "TEST 1: DETECCIÓN DE BORRADO (unlink)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo
-echo "-> Executing primary malware sample..."
-echo "   File: $EICAR_FILE"
-echo "   Expected behavior: Immediate detection and process termination"
-echo "   Hash in database: CONFIRMED"
-echo "   Dual scan capability: ACTIVE"
 
-"$EICAR_FILE" &
-MALWARE_PID=$!
-echo "   Malware process ID: $MALWARE_PID"
-echo "   Monitoring detection response..."
+echo "1.1 Creando archivos de prueba..."
+for ext in txt doc pdf jpg xlsx; do
+    touch "$TEST_DIR/important_file.$ext"
+    echo "    Created: important_file.$ext"
+done
 
-# Wait for detection
-sleep 4
+echo
+echo "1.2 Simulando borrado tipo ransomware..."
+for file in "$TEST_DIR"/*.{txt,doc,pdf}; do
+    if [ -f "$file" ]; then
+        echo -e "    ${YELLOW}Deleting: $(basename $file)${NC}"
+        rm "$file"
+        sleep 0.2  # Pequeña pausa para captura
+    fi
+done
 
-# Check if process was terminated
-if kill -0 $MALWARE_PID 2>/dev/null; then
-    echo "   Process status: Still active (manual termination required)"
-    kill $MALWARE_PID 2>/dev/null
-    echo "   Note: Detection logged, manual cleanup performed"
+echo
+echo "1.3 Verificando captura de eventos UNLINK..."
+sleep 2
+
+UNLINK_COUNT=$(grep -c '"type":"UNLINK"' /tmp/syscall_test.log 2>/dev/null || echo 0)
+if [ "$UNLINK_COUNT" -gt 0 ]; then
+    echo -e "${GREEN}✓ Capturados $UNLINK_COUNT eventos UNLINK${NC}"
+    echo "   Muestra de eventos:"
+    grep '"type":"UNLINK"' /tmp/syscall_test.log | head -3 | while read line; do
+        echo "   $line" | jq -c '{type, path, operation}' 2>/dev/null || echo "   $line"
+    done
 else
-    echo "   Process status: AUTOMATICALLY TERMINATED BY EDR"
-    echo "   Hash detection: SUCCESSFUL"
+    echo -e "${RED}❌ No se capturaron eventos UNLINK${NC}"
 fi
 
+# ======================
+# TEST 2: CHMOD BÁSICO
+# ======================
 echo
-echo "TEST 4.2: Secondary malware sample validation"
-echo "----------------------------------------------"
-echo "-> Executing secondary malware sample..."
-"$MALWARE2_FILE" &
-MALWARE2_PID=$!
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "TEST 2: DETECCIÓN DE CAMBIOS DE PERMISOS"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo
+
+echo "2.1 Creando archivo para pruebas de permisos..."
+TEST_FILE="$TEST_DIR/sensitive_file.sh"
+echo "#!/bin/bash" > "$TEST_FILE"
+echo "echo 'test'" >> "$TEST_FILE"
+
+echo
+echo "2.2 Aplicando cambios de permisos normales..."
+chmod 755 "$TEST_FILE"
+echo -e "    ${GREEN}chmod 755 (normal)${NC}"
+sleep 0.5
+
+chmod 644 "$TEST_FILE"
+echo -e "    ${GREEN}chmod 644 (read-only)${NC}"
+sleep 0.5
+
+echo
+echo "2.3 Aplicando permisos SOSPECHOSOS..."
+
+# SETUID (privilege escalation)
+chmod u+s "$TEST_FILE"
+echo -e "    ${YELLOW}chmod u+s (SETUID) - SUSPICIOUS${NC}"
+sleep 0.5
+
+# World writable
+chmod 777 "$TEST_FILE"
+echo -e "    ${YELLOW}chmod 777 (WORLD ALL) - SUSPICIOUS${NC}"
+sleep 0.5
+
+# SETGID
+chmod g+s "$TEST_FILE"
+echo -e "    ${YELLOW}chmod g+s (SETGID) - SUSPICIOUS${NC}"
+sleep 0.5
+
+echo
+echo "2.4 Verificando captura de eventos CHMOD..."
+sleep 2
+
+CHMOD_COUNT=$(grep -c '"type":"CHMOD"' /tmp/syscall_test.log 2>/dev/null || echo 0)
+if [ "$CHMOD_COUNT" -gt 0 ]; then
+    echo -e "${GREEN}✓ Capturados $CHMOD_COUNT eventos CHMOD${NC}"
+    echo "   Eventos con permisos sospechosos:"
+    grep '"type":"CHMOD"' /tmp/syscall_test.log | grep -i "suspicious" | head -3 | while read line; do
+        echo "   $line" | jq -c '{type, path, mode_decoded, suspicious_reasons}' 2>/dev/null || echo "   $line"
+    done
+else
+    echo -e "${RED}❌ No se capturaron eventos CHMOD${NC}"
+fi
+
+# ================================
+# TEST 3: PATRÓN RANSOMWARE COMPLETO
+# ================================
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "TEST 3: SIMULACIÓN RANSOMWARE COMPLETA"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Patrón: crear → cifrar (write) → borrar original → cambiar permisos"
+echo
+
+RANSOM_DIR="$TEST_DIR/ransomware_test"
+mkdir -p "$RANSOM_DIR"
+
+echo "3.1 Fase 1: Creando archivos víctima..."
+for i in {1..5}; do
+    echo "Important data $i" > "$RANSOM_DIR/document_$i.txt"
+done
+
+echo "3.2 Fase 2: Simulando cifrado..."
+for file in "$RANSOM_DIR"/*.txt; do
+    if [ -f "$file" ]; then
+        base=$(basename "$file" .txt)
+        # Simular write intensivo (cifrado)
+        dd if=/dev/urandom of="$RANSOM_DIR/$base.locked" bs=10K count=1 2>/dev/null
+        echo -e "    Encrypted: $base.txt → $base.locked"
+        
+        # Cambiar permisos del archivo cifrado
+        chmod 400 "$RANSOM_DIR/$base.locked"
+        
+        # Borrar original
+        rm "$file"
+        echo -e "    ${RED}Deleted original: $base.txt${NC}"
+        
+        sleep 0.1
+    fi
+done
+
+echo
+echo "3.3 Analizando patrón completo..."
 sleep 3
 
-if kill -0 $MALWARE2_PID 2>/dev/null; then
-    kill $MALWARE2_PID 2>/dev/null
-    echo "   Secondary sample: Detection confirmed, manual cleanup"
-else
-    echo "   Secondary sample: Automatically terminated"
-fi
+# Análisis del patrón
+echo "📊 Resumen de eventos capturados:"
+echo -n "   WRITE (cifrado): "
+grep -c '"type":"WRITE"' /tmp/syscall_test.log 2>/dev/null || echo 0
 
-echo "   Hash-based detection validation: COMPLETE"
+echo -n "   UNLINK (borrado): "
+grep -c '"type":"UNLINK"' /tmp/syscall_test.log 2>/dev/null || echo 0
 
+echo -n "   CHMOD (permisos): "
+grep -c '"type":"CHMOD"' /tmp/syscall_test.log 2>/dev/null || echo 0
+
+echo -n "   OPEN con .locked: "
+grep '"type":"OPEN"' /tmp/syscall_test.log | grep -c '\.locked' 2>/dev/null || echo 0
+
+# =====================
+# TEST 4: STRESS TEST
+# =====================
 echo
-echo "PHASE 5: BEHAVIORAL ANALYSIS VALIDATION"
-echo "========================================"
-echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "TEST 4: STRESS TEST (100 operaciones)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-echo "TEST 5.1: Ransomware pattern detection"
-echo "---------------------------------------"
-echo "Objective: Detect rapid file creation with suspicious extensions"
-echo "Method: Create multiple files with .locked extension in sequence"
-echo
-echo "-> Simulating ransomware file encryption behavior..."
-echo "   Creating 7 files with .locked extension"
-echo "   Anti-spam mechanism should generate single alert"
+STRESS_DIR="$TEST_DIR/stress"
+mkdir -p "$STRESS_DIR"
 
-for i in {1..7}; do
-    echo "encrypted_document_data_$i" > "$DEMO_DIR/document_$i.locked"
-    sleep 0.4
+echo "Ejecutando ráfaga de operaciones..."
+START_TIME=$(date +%s)
+
+for i in {1..100}; do
+    # Crear archivo
+    touch "$STRESS_DIR/file_$i.tmp"
+    
+    # Cambiar permisos
+    chmod 644 "$STRESS_DIR/file_$i.tmp"
+    
+    # Borrar si es múltiplo de 3
+    if [ $((i % 3)) -eq 0 ]; then
+        rm "$STRESS_DIR/file_$i.tmp"
+    fi
 done
 
-echo "   File creation simulation: COMPLETE"
-echo "   Expected: Single ransomware alert (anti-spam active)"
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo "Completado en $DURATION segundos"
+echo "Rate: $((100 / DURATION)) ops/segundo"
+
+# =====================
+# ANÁLISIS FINAL
+# =====================
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "ANÁLISIS FINAL"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Contar eventos totales
+TOTAL_EVENTS=$(wc -l < /tmp/syscall_test.log 2>/dev/null || echo 0)
+EXEC_COUNT=$(grep -c '"type":"EXEC"' /tmp/syscall_test.log 2>/dev/null || echo 0)
+OPEN_COUNT=$(grep -c '"type":"OPEN"' /tmp/syscall_test.log 2>/dev/null || echo 0)
+WRITE_COUNT=$(grep -c '"type":"WRITE"' /tmp/syscall_test.log 2>/dev/null || echo 0)
+UNLINK_FINAL=$(grep -c '"type":"UNLINK"' /tmp/syscall_test.log 2>/dev/null || echo 0)
+CHMOD_FINAL=$(grep -c '"type":"CHMOD"' /tmp/syscall_test.log 2>/dev/null || echo 0)
+
+echo "📈 Estadísticas de captura:"
+echo "   Total eventos: $TOTAL_EVENTS"
+echo "   ├─ EXEC:   $EXEC_COUNT"
+echo "   ├─ OPEN:   $OPEN_COUNT"
+echo "   ├─ WRITE:  $WRITE_COUNT"
+echo -e "   ├─ ${GREEN}UNLINK: $UNLINK_FINAL (NUEVO)${NC}"
+echo -e "   └─ ${GREEN}CHMOD:  $CHMOD_FINAL (NUEVO)${NC}"
 
 echo
-echo "TEST 5.2: Suspicious network process detection"
-echo "-----------------------------------------------"
-echo "-> Executing network reconnaissance tools..."
+echo "🔍 Detecciones sospechosas:"
+SUSPICIOUS_UNLINKS=$(grep '"type":"UNLINK"' /tmp/syscall_test.log | grep -c "suspicious_deletion" 2>/dev/null || echo 0)
+SUSPICIOUS_CHMODS=$(grep '"type":"CHMOD"' /tmp/syscall_test.log | grep -c "suspicious_chmod" 2>/dev/null || echo 0)
 
-nc -l 8888 &
-NC_PID=$!
-sleep 1
+echo "   Borrados sospechosos: $SUSPICIOUS_UNLINKS"
+echo "   Permisos peligrosos:  $SUSPICIOUS_CHMODS"
 
-curl --version > /dev/null 2>&1 &
-wget --version > /dev/null 2>&1 &
-
-echo "   Network tools executed: netcat, curl, wget"
-echo "   Expected: Suspicious process alerts"
-
+# Validación de funcionalidad
 echo
-echo "TEST 5.3: High-volume write operation detection"
-echo "------------------------------------------------"
-echo "-> Simulating intensive disk write operations..."
+echo "🎯 Validación de funcionalidad:"
 
-python3 - <<'EOF'
-import os
-write_dir = "/tmp/write_test_intensive"
-os.makedirs(write_dir, exist_ok=True)
-filename = f"{write_dir}/intensive_write.bin"
-fd = os.open(filename, os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o644)
-chunk = b'A' * (50 * 1024)  # 50KB chunks
-for i in range(60):  # 3MB total in 60 operations
-    os.write(fd, chunk)
-os.close(fd)
-print("Intensive write simulation completed: 3MB in 60 write operations")
-EOF
+TESTS_PASSED=0
+TESTS_TOTAL=4
 
-echo "   Write operation simulation: COMPLETE"
-echo "   Expected: Write burst detection alert"
-
-echo
-echo "PHASE 6: EXTENDED MONITORING PERIOD"
-echo "===================================="
-echo
-
-echo "-> Initiating extended monitoring period..."
-echo "   Duration: $TEST_DURATION seconds"
-echo "   Purpose: Capture comprehensive event dataset"
-echo "   Monitoring: All syscalls and behavioral patterns"
-
-for i in $(seq 1 $TEST_DURATION); do
-    echo -ne "   Monitoring progress: $i/$TEST_DURATION seconds\r"
-    sleep 1
-done
-echo
-echo "   Extended monitoring: COMPLETE"
-
-echo
-echo "PHASE 7: COMPREHENSIVE RESULTS ANALYSIS"
-echo "========================================"
-echo
-
-echo "-> Terminating monitoring processes..."
-kill $EDR_PID $NC_PID 2>/dev/null || true
-killall nc curl wget python3 2>/dev/null || true
-sleep 4
-echo "   All monitoring processes terminated"
-
-echo
-echo "ANALYSIS 7.1: Malware Detection Results"
-echo "---------------------------------------"
-
-if [ -f "$DET_LOG" ]; then
-    echo "-> Hash-based malware detections:"
-    
-    MALWARE_DETECTIONS=$(grep "MALWARE DETECTADO POR HASH" "$DET_LOG" 2>/dev/null || echo "")
-    if [ -n "$MALWARE_DETECTIONS" ]; then
-        echo "$MALWARE_DETECTIONS" | head -5 | sed 's/^/   /'
-        MALWARE_COUNT=$(echo "$MALWARE_DETECTIONS" | grep -c "MALWARE DETECTADO POR HASH" || echo 0)
-        echo "   Total malware detections: $MALWARE_COUNT"
-        echo "   Hash detection system: OPERATIONAL"
-    else
-        echo "   No hash-based detections found in log"
-        echo "   Status: Requires verification"
-    fi
-    
-    echo
-    echo "-> Behavioral analysis results:"
-    
-    HEURISTIC_ALERTS=$(grep "ALERTA:" "$DET_LOG" 2>/dev/null | grep -v "MALWARE DETECTADO" || echo "")
-    if [ -n "$HEURISTIC_ALERTS" ]; then
-        echo "$HEURISTIC_ALERTS" | head -8 | sed 's/^/   /'
-        ALERT_COUNT=$(echo "$HEURISTIC_ALERTS" | wc -l)
-        echo "   Total behavioral alerts: $ALERT_COUNT"
-        
-        # Anti-spam verification
-        RANSOMWARE_ALERTS=$(echo "$HEURISTIC_ALERTS" | grep "RANSOMWARE" | wc -l)
-        if [ "$RANSOMWARE_ALERTS" -eq "1" ]; then
-            echo "   Anti-spam mechanism: FUNCTIONAL (single ransomware alert)"
-        else
-            echo "   Anti-spam status: $RANSOMWARE_ALERTS ransomware alerts detected"
-        fi
-        
-        WRITE_ALERTS=$(echo "$HEURISTIC_ALERTS" | grep "ESCRITURA INTENSIVA" | wc -l)
-        echo "   Write burst detections: $WRITE_ALERTS"
-        
-        SUSPICIOUS_PROC=$(echo "$HEURISTIC_ALERTS" | grep "sospechoso" | wc -l)
-        echo "   Suspicious process alerts: $SUSPICIOUS_PROC"
-        
-    else
-        echo "   No behavioral alerts detected"
-    fi
-    
-    echo
-    echo "-> System performance metrics:"
-    
-    tail -20 "$DET_LOG" | grep -E "(Total eventos|Rate|Hash scans|eventos/segundo|Tiempo ejecución)" | head -8 | sed 's/^/   /'
-    
+# Test 1: Captura UNLINK
+if [ "$UNLINK_FINAL" -gt 0 ]; then
+    echo -e "   ${GREEN}✓ UNLINK funcional${NC}"
+    ((TESTS_PASSED++))
 else
-    echo "ERROR: Detection log file not found"
-    echo "Path: $DET_LOG"
+    echo -e "   ${RED}✗ UNLINK no capturado${NC}"
 fi
 
-echo
-echo "ANALYSIS 7.2: Database Persistence Verification"
-echo "------------------------------------------------"
-
-if [ -f "$DB" ]; then
-    echo "-> Database analysis:"
-    
-    TOTAL_EVENTS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events;" 2>/dev/null || echo "0")
-    ALERT_EVENTS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE alert_level IS NOT NULL;" 2>/dev/null || echo "0")
-    MALWARE_EVENTS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE malware_family IS NOT NULL;" 2>/dev/null || echo "0")
-    HASH_SCANS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE file_hash IS NOT NULL;" 2>/dev/null || echo "0")
-    EXEC_EVENTS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE event_type='EXEC';" 2>/dev/null || echo "0")
-    OPEN_EVENTS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE event_type='OPEN';" 2>/dev/null || echo "0")
-    WRITE_EVENTS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE event_type='WRITE';" 2>/dev/null || echo "0")
-    
-    echo "   Database statistics:"
-    echo "      Total events stored: $TOTAL_EVENTS"
-    echo "      Events with alerts: $ALERT_EVENTS"
-    echo "      Malware detections: $MALWARE_EVENTS"
-    echo "      Hash scans performed: $HASH_SCANS"
-    echo "      EXEC events: $EXEC_EVENTS"
-    echo "      OPEN events: $OPEN_EVENTS"
-    echo "      WRITE events: $WRITE_EVENTS"
-    
-    if [ "$TOTAL_EVENTS" -gt "0" ]; then
-        echo "   Database persistence: OPERATIONAL"
-        
-        if [ "$MALWARE_EVENTS" -gt "0" ]; then
-            echo
-            echo "   Detected malware families:"
-            sqlite3 "$DB" "
-            SELECT '      ' || malware_family || ': ' || COUNT(*) || ' detection(s)'
-            FROM events 
-            WHERE malware_family IS NOT NULL
-            GROUP BY malware_family;" 2>/dev/null
-        fi
-        
-        echo
-        echo "   Recent critical events:"
-        sqlite3 "$DB" "
-        SELECT '      ' || datetime(timestamp, 'unixepoch') || ' | ' || 
-               comm || ' | ' || 
-               CASE WHEN alert_level = 'CRITICAL' THEN 'MALWARE: ' || malware_family
-                    WHEN alert_level = 'ALERT' THEN 'BEHAVIORAL ALERT'
-                    WHEN alert_level = 'INFO' THEN 'SUSPICIOUS ACTIVITY'
-                    ELSE event_type || ' EVENT' END
-        FROM events 
-        WHERE alert_level IS NOT NULL
-        ORDER BY timestamp DESC 
-        LIMIT 10;" 2>/dev/null
-        
-    else
-        echo "   WARNING: Database contains no events"
-    fi
-    
+# Test 2: Captura CHMOD
+if [ "$CHMOD_FINAL" -gt 0 ]; then
+    echo -e "   ${GREEN}✓ CHMOD funcional${NC}"
+    ((TESTS_PASSED++))
 else
-    echo "ERROR: Event database not found"
-    echo "Expected location: $DB"
+    echo -e "   ${RED}✗ CHMOD no capturado${NC}"
 fi
 
-echo
-echo "ANALYSIS 7.3: System Performance Assessment"
-echo "-------------------------------------------"
-
-# Calculate performance metrics
-if [ -f "$JSON_LOG" ]; then
-    TOTAL_JSON_EVENTS=$(grep -c '^{' "$JSON_LOG" || echo 0)
-    EXEC_JSON=$(grep -c '"type":"EXEC"' "$JSON_LOG" || echo 0)
-    OPEN_JSON=$(grep -c '"type":"OPEN"' "$JSON_LOG" || echo 0)
-    WRITE_JSON=$(grep -c '"type":"WRITE"' "$JSON_LOG" || echo 0)
-    
-    echo "-> Event collection performance:"
-    echo "   Total JSON events: $TOTAL_JSON_EVENTS"
-    echo "   EXEC events captured: $EXEC_JSON"
-    echo "   OPEN events captured: $OPEN_JSON"
-    echo "   WRITE events captured: $WRITE_JSON"
-    
-    if [ "$TOTAL_JSON_EVENTS" -gt "0" ]; then
-        echo "   Event collection: HIGH PERFORMANCE"
-        echo "   System overhead: MINIMAL (eBPF kernel-space monitoring)"
-    else
-        echo "   Event collection: REQUIRES REVIEW"
-    fi
+# Test 3: Detección de patrones sospechosos
+if [ "$SUSPICIOUS_UNLINKS" -gt 0 ] || [ "$SUSPICIOUS_CHMODS" -gt 0 ]; then
+    echo -e "   ${GREEN}✓ Detección de patrones sospechosos${NC}"
+    ((TESTS_PASSED++))
 else
-    echo "WARNING: JSON event log not found"
+    echo -e "   ${YELLOW}⚠ Sin detección de patrones (revisar umbrales)${NC}"
 fi
 
-echo
-echo "-> Threat intelligence status:"
-FINAL_HASH_COUNT=$(sqlite3 malware_hashes.db "SELECT COUNT(*) FROM malware_hashes;" 2>/dev/null || echo "0")
-echo "   Threat signatures: $FINAL_HASH_COUNT loaded"
-echo "   Signature sources: MalwareBazaar + Custom samples"
-
-echo
-echo "PHASE 8: TECHNICAL VALIDATION SUMMARY"
-echo "======================================"
-echo
-
-FINAL_EVENT_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events;" 2>/dev/null || echo "0")
-FINAL_MALWARE_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE malware_family IS NOT NULL;" 2>/dev/null || echo "0")
-FINAL_ALERT_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE alert_level IS NOT NULL;" 2>/dev/null || echo "0")
-
-echo "IMPLEMENTATION VERIFICATION:"
-echo "----------------------------"
-
-# Hash detection validation
-if [ "$FINAL_MALWARE_COUNT" -gt "0" ]; then
-    echo "   [PASS] Hash-based detection: FUNCTIONAL"
-    echo "          Malware samples detected and logged"
+# Test 4: Sistema estable
+if kill -0 $EDR_PID 2>/dev/null; then
+    echo -e "   ${GREEN}✓ Sistema estable tras stress test${NC}"
+    ((TESTS_PASSED++))
 else
-    echo "   [REVIEW] Hash-based detection: Requires verification"
-    echo "            No malware detections in database"
+    echo -e "   ${RED}✗ Sistema crasheó durante las pruebas${NC}"
 fi
 
-# Event persistence validation
-if [ "$FINAL_EVENT_COUNT" -gt "100" ]; then
-    echo "   [PASS] Event persistence: FUNCTIONAL"
-    echo "          Comprehensive event logging active"
-elif [ "$FINAL_EVENT_COUNT" -gt "0" ]; then
-    echo "   [PARTIAL] Event persistence: Limited data captured"
-else
-    echo "   [REVIEW] Event persistence: No events in database"
-fi
-
-# System integration validation
-if [ -f "$DET_LOG" ] && [ -f "$JSON_LOG" ]; then
-    echo "   [PASS] System integration: FUNCTIONAL"
-    echo "          Full pipeline operational"
-else
-    echo "   [REVIEW] System integration: Missing log files"
-fi
-
-# Performance validation
-if [ "$TOTAL_JSON_EVENTS" -gt "100" ]; then
-    echo "   [PASS] Performance: HIGH EFFICIENCY"
-    echo "          Real-time event processing confirmed"
-else
-    echo "   [REVIEW] Performance: Limited event processing"
-fi
-
+# Resultado final
 echo
-echo "COMPREHENSIVE METRICS:"
-echo "----------------------"
-echo "   Events processed: $FINAL_EVENT_COUNT"
-echo "   Malware detected: $FINAL_MALWARE_COUNT"
-echo "   Alerts generated: $FINAL_ALERT_COUNT"
-echo "   Threat signatures: $FINAL_HASH_COUNT"
-echo "   System uptime: $TEST_DURATION seconds"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ "$TESTS_PASSED" -eq "$TESTS_TOTAL" ]; then
+    echo -e "${GREEN}✅ TODAS LAS PRUEBAS PASADAS ($TESTS_PASSED/$TESTS_TOTAL)${NC}"
+    echo "Las nuevas syscalls están funcionando correctamente"
+else
+    echo -e "${YELLOW}⚠️  PRUEBAS PARCIALES: $TESTS_PASSED/$TESTS_TOTAL pasadas${NC}"
+    echo "Revisar logs para más detalles"
+fi
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-
+# Cleanup
 echo
-echo "-> Performing system cleanup..."
-rm -rf "$DEMO_DIR"
-rm -f "$LOG_FILE" 2>/dev/null || true
-echo "   Cleanup completed successfully"
+echo "🧹 Limpiando..."
+kill $EDR_PID 2>/dev/null || true
+rm -rf "$TEST_DIR"
 
+echo "✨ Test completado"
 echo
-echo "================================================================================"
-echo "                                   FIN DEMO                                     "
-echo "================================================================================"
+echo "📝 Logs guardados en:"
+echo "   - /tmp/syscall_test.log (eventos JSON)"
+echo "   - /tmp/syscall_test.err (errores/debug)"

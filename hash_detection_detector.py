@@ -2,6 +2,7 @@
 """
 hash_detection_detector.py 
 Umbrales realistas + debug mejorado + anti-spam 
+ARREGLADO: Error de sintaxis en stats
 """
 
 import sys
@@ -35,6 +36,13 @@ class Event:
     scan_method: Optional[str] = None
     # Campo para eventos WRITE
     bytes_written: Optional[int] = None
+    # NUEVOS CAMPOS para unlink/chmod
+    operation: Optional[str] = None  # Para UNLINK: "DELETE"
+    mode: Optional[int] = None  # Para CHMOD: permisos nuevos
+    mode_decoded: Optional[str] = None  # Permisos decodificados
+    suspicious_deletion: Optional[bool] = None  # Borrado sospechoso
+    suspicious_chmod: Optional[bool] = None  # Permisos peligrosos
+    suspicious_reasons: Optional[List[str]] = None  # Razones de sospecha
 
 class ThreatDetectorFixed:
     """Detector WRITE CORREGIDO con umbrales realistas"""
@@ -46,6 +54,20 @@ class ThreatDetectorFixed:
         self.file_windows = defaultdict(deque)
         self.exec_windows = defaultdict(deque)
         
+        # Ventanas para nuevas syscalls
+        self.deletion_windows = defaultdict(deque)  # Ventana para UNLINK
+        self.chmod_windows = defaultdict(deque)     # Ventana para CHMOD
+
+        # Contadores específicos
+        self.deletion_patterns = {
+            'user_files': defaultdict(int),  # Archivos de usuario borrados
+            'last_reset': time.time()
+        }
+    
+        # Estados de alerta para anti-spam
+        self.mass_deletion_alerted = set()  # PIDs alertados por borrado masivo
+        self.privilege_escalation_alerted = set()  # PIDs alertados por chmod sospechoso
+
         # CORREGIDO: Contadores WRITE con reset menos agresivo
         self.write_counters = {
             'ops': defaultdict(int),     # Número de operaciones write
@@ -92,10 +114,34 @@ class ThreatDetectorFixed:
             "suspicious_extensions": {
                 ".locked", ".enc", ".crypt", ".encrypt", ".encrypted",
                 ".vault", ".crypto", ".secure", ".ransomed"
+            },
+
+            # Umbrales para UNLINK
+            "deletion_burst_threshold": 10,  # 10 archivos en ventana
+            "deletion_time_window": 30,      # 30 segundos
+            "critical_deletion_threshold": 5, # 5 archivos críticos
+            
+            # Umbrales para CHMOD  
+            "chmod_suspicious_threshold": 3,  # 3 cambios sospechosos
+            "chmod_time_window": 60,          # 60 segundos
+            
+            # Extensiones críticas para ransomware
+            "critical_extensions": {
+                ".doc", ".docx", ".pdf", ".jpg", ".jpeg", ".png",
+                ".xlsx", ".xls", ".ppt", ".pptx", ".zip", ".rar",
+                ".txt", ".csv", ".sql", ".db", ".bak"
+            },
+            
+            # Permisos peligrosos
+            "dangerous_permissions": {
+                0o4000: "SETUID",  # Privilege escalation
+                0o2000: "SETGID",  # Group privilege
+                0o777:  "WORLD_ALL",  # World writable/executable
+                0o666:  "WORLD_RW"    # World readable/writable
             }
         }
         
-        # Estadísticas MEJORADAS con soporte WRITE
+        # Estadísticas MEJORADAS con soporte WRITE - ARREGLADO
         self.stats = {
             "total_events": 0,
             "alerts_by_type": defaultdict(int),
@@ -115,9 +161,17 @@ class ThreatDetectorFixed:
             "write_alerts": 0,
             "write_processes": set(),  # PIDs únicos que han hecho WRITE
             "write_burst_checks": 0,   # DEBUG: cuántas veces se llamó _check_write_burst
-            "write_resets": 0          # DEBUG: cuántas veces se resetearon contadores
+            "write_resets": 0,         # DEBUG: cuántas veces se resetearon contadores - ARREGLADO
+             # Estadísticas para nuevos eventos
+            "unlink_events": 0,
+            "chmod_events": 0,
+            "mass_deletions_detected": 0,
+            "privilege_escalations_detected": 0,
+            "ransomware_deletion_patterns": 0
         }
         
+        
+
         # PERSISTENCIA SQLite con esquema corregido
         self.setup_database()
         
@@ -126,8 +180,9 @@ class ThreatDetectorFixed:
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGPIPE, self._signal_handler)
 
+
     def setup_database(self):
-        """Configurar base de datos de eventos con esquema corregido"""
+        """Configurar base de datos de eventos con esquema expandido para nuevas syscalls"""
         try:
             self.db_conn = sqlite3.connect("edr_events.db")
             
@@ -136,7 +191,7 @@ class ThreatDetectorFixed:
             table_exists = cursor.fetchone() is not None
             
             if not table_exists:
-                # Crear tabla completa con bytes_written incluido
+                # Crear tabla completa con TODAS las columnas incluyendo las nuevas
                 self.db_conn.execute("""
                     CREATE TABLE events(
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,36 +211,72 @@ class ThreatDetectorFixed:
                         scan_method TEXT,
                         uid INTEGER,
                         gid INTEGER,
-                        bytes_written INTEGER
+                        bytes_written INTEGER,
+                        operation TEXT,
+                        mode INTEGER,
+                        mode_decoded TEXT,
+                        suspicious_deletion INTEGER,
+                        suspicious_chmod INTEGER,
+                        suspicious_reasons TEXT
                     )
                 """)
-                print("Tabla events creada con esquema completo", file=sys.stderr)
+                print("Tabla events creada con esquema expandido (incluye UNLINK/CHMOD)", file=sys.stderr)
             else:
-                # Verificar si bytes_written existe
+                # Tabla existe - verificar y añadir columnas faltantes
                 cursor = self.db_conn.execute("PRAGMA table_info(events)")
-                columns = [row[1] for row in cursor.fetchall()]
+                existing_columns = [row[1] for row in cursor.fetchall()]
                 
-                if 'bytes_written' not in columns:
-                    # Añadir columna que falta
-                    self.db_conn.execute("ALTER TABLE events ADD COLUMN bytes_written INTEGER")
-                    print("Columna bytes_written añadida a tabla existente", file=sys.stderr)
+                # Lista de columnas que deben existir (nombre, tipo)
+                required_columns = [
+                    ("bytes_written", "INTEGER"),
+                    ("operation", "TEXT"),
+                    ("mode", "INTEGER"),
+                    ("mode_decoded", "TEXT"),
+                    ("suspicious_deletion", "INTEGER"),
+                    ("suspicious_chmod", "INTEGER"),
+                    ("suspicious_reasons", "TEXT")
+                ]
+                
+                columns_added = []
+                for column_name, column_type in required_columns:
+                    if column_name not in existing_columns:
+                        try:
+                            self.db_conn.execute(f"ALTER TABLE events ADD COLUMN {column_name} {column_type}")
+                            columns_added.append(column_name)
+                        except sqlite3.OperationalError as e:
+                            # La columna ya existe o hay otro error
+                            if "duplicate column name" not in str(e).lower():
+                                print(f"Error añadiendo columna {column_name}: {e}", file=sys.stderr)
+                
+                if columns_added:
+                    print(f"Columnas añadidas a tabla existente: {', '.join(columns_added)}", file=sys.stderr)
                 else:
-                    print("Esquema de base de datos correcto", file=sys.stderr)
+                    print("Esquema de base de datos ya completo", file=sys.stderr)
             
-            # Crear índices
+            # Crear índices (incluir nuevos para optimización)
             indexes = [
                 "CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)",
                 "CREATE INDEX IF NOT EXISTS idx_pid ON events(pid)",
                 "CREATE INDEX IF NOT EXISTS idx_alert_level ON events(alert_level)",
                 "CREATE INDEX IF NOT EXISTS idx_malware ON events(malware_family)",
-                "CREATE INDEX IF NOT EXISTS idx_event_type ON events(event_type)"
+                "CREATE INDEX IF NOT EXISTS idx_event_type ON events(event_type)",
+                "CREATE INDEX IF NOT EXISTS idx_operation ON events(operation)",  # NUEVO
+                "CREATE INDEX IF NOT EXISTS idx_suspicious ON events(suspicious_deletion, suspicious_chmod)"  # NUEVO
             ]
             
             for idx in indexes:
-                self.db_conn.execute(idx)
+                try:
+                    self.db_conn.execute(idx)
+                except sqlite3.OperationalError:
+                    pass  # Índice ya existe
             
             self.db_conn.commit()
             print("Base de datos SQLite configurada: edr_events.db", file=sys.stderr)
+            
+            # Debug: mostrar esquema final
+            cursor = self.db_conn.execute("PRAGMA table_info(events)")
+            total_columns = len(cursor.fetchall())
+            print(f"Esquema final: {total_columns} columnas en tabla events", file=sys.stderr)
             
         except Exception as e:
             print(f"Error configurando base de datos: {e}", file=sys.stderr)
@@ -248,7 +339,21 @@ class ThreatDetectorFixed:
                 self._update_stats_complete(event)
                 self._persist_event(event, None, None)
                 return None
-                
+            
+            # Procesar campos específicos de UNLINK
+            if event_data.get("type") == "UNLINK":
+                event.operation = event_data.get("operation", "DELETE")
+                event.suspicious_deletion = event_data.get("suspicious_deletion", False)
+                self.stats["unlink_events"] += 1
+            
+            # Procesar campos específicos de CHMOD
+            elif event_data.get("type") == "CHMOD":
+                event.mode = event_data.get("mode")
+                event.mode_decoded = event_data.get("mode_decoded")
+                event.suspicious_chmod = event_data.get("suspicious_chmod", False)
+                event.suspicious_reasons = event_data.get("suspicious_reasons", [])
+                self.stats["chmod_events"] += 1
+
             # Actualizar estadísticas mejoradas
             self._update_stats_complete(event)
             
@@ -399,7 +504,7 @@ class ThreatDetectorFixed:
             self.stats["last_second"] = current_second
     
     def _persist_event(self, event: Event, alert_level: str, alert_message: str):
-        """Guardar evento en base de datos"""
+        """Persistir evento en base de datos - VERSIÓN EXPANDIDA"""
         if not self.db_conn:
             return
             
@@ -411,29 +516,69 @@ class ThreatDetectorFixed:
                 malware_family = event.malware_info.get('family')
                 malware_source = event.malware_info.get('source')
             
+            # Convertir suspicious_reasons a JSON string si existe
+            suspicious_reasons_json = None
+            if hasattr(event, 'suspicious_reasons') and event.suspicious_reasons:
+                suspicious_reasons_json = json.dumps(event.suspicious_reasons)
+            
+            # Preparar valores con los NUEVOS campos
+            values = (
+                event.timestamp, 
+                event.pid, 
+                event.ppid, 
+                event.comm, 
+                event.event_type, 
+                event.path, 
+                event.flags, 
+                event.flags_decoded,
+                alert_level, 
+                alert_message, 
+                event.file_hash, 
+                malware_family, 
+                malware_source, 
+                event.scan_method,
+                event.uid, 
+                event.gid, 
+                event.bytes_written,
+                # NUEVOS CAMPOS
+                getattr(event, 'operation', None),  # Para UNLINK
+                getattr(event, 'mode', None),  # Para CHMOD
+                getattr(event, 'mode_decoded', None),  # Permisos decodificados
+                1 if getattr(event, 'suspicious_deletion', False) else 0,  # Boolean as int
+                1 if getattr(event, 'suspicious_chmod', False) else 0,  # Boolean as int
+                suspicious_reasons_json  # JSON array de razones
+            )
+            
+            # SQL con TODOS los campos
             self.db_conn.execute("""
                 INSERT INTO events(
                     timestamp, pid, ppid, comm, event_type, path, 
                     flags, flags_decoded, alert_level, alert_message,
                     file_hash, malware_family, malware_source, scan_method,
-                    uid, gid, bytes_written
+                    uid, gid, bytes_written,
+                    operation, mode, mode_decoded, 
+                    suspicious_deletion, suspicious_chmod, suspicious_reasons
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                event.timestamp, event.pid, event.ppid, event.comm, 
-                event.event_type, event.path, event.flags, event.flags_decoded,
-                alert_level, alert_message, event.file_hash, 
-                malware_family, malware_source, event.scan_method,
-                event.uid, event.gid, event.bytes_written
-            ))
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, values)
             
-            # Commit cada 50 eventos
+            # Commit cada 50 eventos para performance
             if self.stats["total_events"] % 50 == 0:
                 self.db_conn.commit()
                 
+            # Debug para nuevos tipos de eventos
+            if event.event_type in ["UNLINK", "CHMOD"]:
+                if self.stats["total_events"] % 100 == 0:
+                    print(f"DB: Guardados {self.stats['unlink_events']} UNLINK, {self.stats['chmod_events']} CHMOD", file=sys.stderr)
+                    
         except Exception as e:
-            print(f"DB Error: {e}", file=sys.stderr)
-    
+            print(f"DB Error al guardar evento {event.event_type}: {e}", file=sys.stderr)
+            # En caso de error, intentar commit parcial
+            try:
+                self.db_conn.rollback()
+            except:
+                pass
+        
     def _run_detection_rules_complete(self, event: Event) -> Optional[str]:
         """Reglas de detección COMPLETAS + WRITE CORREGIDO"""
         
@@ -468,6 +613,22 @@ class ThreatDetectorFixed:
         alert = self._check_suspicious_locations_improved(event)
         if alert:
             self.stats["alerts_by_type"]["suspicious_location"] += 1
+            return alert
+        
+        # NUEVAS DETECCIONES
+        alert = self._check_mass_deletion(event)
+        if alert:
+            self.stats["alerts_by_type"]["mass_deletion"] += 1
+            return alert
+        
+        alert = self._check_privilege_escalation(event)
+        if alert:
+            self.stats["alerts_by_type"]["privilege_escalation"] += 1
+            return alert
+        
+        alert = self._check_ransomware_pattern_composite(event)
+        if alert:
+            self.stats["alerts_by_type"]["ransomware_composite"] += 1
             return alert
             
         return None
@@ -610,6 +771,176 @@ class ThreatDetectorFixed:
             
         return None
     
+
+    def _check_mass_deletion(self, event: Event) -> Optional[str]:
+        """
+        Detectar borrado masivo de archivos (ransomware pattern)
+        Basado en paper: "Unveiling the Landscape of Ransomware" (2023)
+        """
+        if event.event_type != "UNLINK":
+            return None
+            
+        current_time = event.timestamp
+        pid = event.pid
+        
+        # Anti-spam: ya alertado?
+        if pid in self.mass_deletion_alerted:
+            return None
+        
+        #mantener esto?
+        if current_time - self.deletion_patterns['last_reset'] > self.config["deletion_time_window"] * 2:  # e.g., doble ventana
+            self.deletion_patterns['user_files'].clear()
+            self.deletion_patterns['last_reset'] = current_time
+
+        # Actualizar ventana temporal
+        window = self.deletion_windows[pid]
+        while window and current_time - window[0] > self.config["deletion_time_window"]:
+            window.popleft()
+        
+        # Añadir evento actual
+        window.append(current_time)
+        
+        # Análisis de archivos críticos borrados
+        critical_count = 0
+        if event.path:
+            # Verificar extensión crítica
+            for ext in self.config["critical_extensions"]:
+                if event.path.endswith(ext):
+                    critical_count = 1
+                    self.deletion_patterns['user_files'][pid] += 1
+                    break
+        
+        # DETECCIÓN 1: Ráfaga de borrados
+        if len(window) >= self.config["deletion_burst_threshold"]:
+            self.mass_deletion_alerted.add(pid)
+            self.stats["mass_deletions_detected"] += 1
+            return f"BORRADO MASIVO: {len(window)} archivos eliminados en {self.config['deletion_time_window']}s (PID {pid})"
+        
+        # DETECCIÓN 2: Borrado de archivos críticos
+        user_files_deleted = self.deletion_patterns['user_files'][pid]
+        if user_files_deleted >= self.config["critical_deletion_threshold"]:
+            self.mass_deletion_alerted.add(pid)
+            self.stats["ransomware_deletion_patterns"] += 1
+            return f"PATRÓN RANSOMWARE: {user_files_deleted} archivos de usuario borrados (PID {pid})"
+        
+        return None
+
+    def _check_privilege_escalation(self, event: Event) -> Optional[str]:
+        """
+        Detectar cambios de permisos sospechosos (privilege escalation)
+        Basado en MITRE ATT&CK T1548 - Abuse Elevation Control Mechanism
+        """
+        if event.event_type != "CHMOD":
+            return None
+        
+        pid = event.pid
+        
+        # Anti-spam
+        if pid in self.privilege_escalation_alerted:
+            return None
+        
+        # Analizar permisos
+        if not hasattr(event, 'mode') or event.mode is None:
+            return None
+            
+        mode = event.mode
+        suspicious_perms = []
+        
+        # Verificar cada permiso peligroso
+        for dangerous_mode, description in self.config["dangerous_permissions"].items():
+            if dangerous_mode == 0o777 or dangerous_mode == 0o666:
+                # Verificar permisos exactos
+                if (mode & 0o777) == dangerous_mode:
+                    suspicious_perms.append(description)
+            else:
+                # Verificar bits especiales
+                if mode & dangerous_mode:
+                    suspicious_perms.append(description)
+        
+        if not suspicious_perms:
+            return None
+        
+        # Actualizar ventana temporal
+        current_time = event.timestamp
+        window = self.chmod_windows[pid]
+        
+        while window and current_time - window[0] > self.config["chmod_time_window"]:
+            window.popleft()
+        
+        window.append(current_time)
+        
+        # DETECCIÓN: Múltiples cambios sospechosos
+        if len(window) >= self.config["chmod_suspicious_threshold"]:
+            self.privilege_escalation_alerted.add(pid)
+            self.stats["privilege_escalations_detected"] += 1
+            perms_str = ", ".join(suspicious_perms)
+            return f"ESCALACIÓN PRIVILEGIOS: {len(window)} cambios sospechosos [{perms_str}] (PID {pid})"
+        
+        # Alerta individual para SETUID/SETGID
+        if "SETUID" in suspicious_perms or "SETGID" in suspicious_perms:
+            if event.path and any(critical in event.path for critical in ["/tmp", "/dev/shm", "/var/tmp"]):
+                return f"ALERTA CRÍTICA: {suspicious_perms[0]} en ubicación sospechosa: {event.path}"
+        
+        return None
+
+    def _check_ransomware_pattern_composite(self, event: Event) -> Optional[str]:
+        """
+        Detección compuesta: CREATE + WRITE + DELETE pattern
+        Score-based detection inspirado en ESCAPADe paper
+        """
+        pid = event.pid
+        current_time = event.timestamp
+        
+        # Calcular score compuesto
+        score = 0
+        indicators = []
+        
+        # Score por tipo de evento
+        if event.event_type == "UNLINK":
+            # Verificar si es archivo de usuario
+            if event.path and any(event.path.endswith(ext) for ext in self.config["critical_extensions"]):
+                score += 3
+                indicators.append("user_file_deletion")
+                
+        elif event.event_type == "OPEN":
+            # Verificar creación con extensión sospechosa
+            if event.flags and (event.flags & 0x40):  # O_CREAT
+                if event.path and any(event.path.endswith(ext) for ext in self.config["suspicious_extensions"]):
+                    score += 4
+                    indicators.append("ransomware_extension")
+                    
+        elif event.event_type == "WRITE":
+            # Escritura intensiva
+            if event.bytes_written and event.bytes_written > 10*1024*1024:  # >10MB
+                score += 2
+                indicators.append("large_write")
+                
+        elif event.event_type == "CHMOD":
+            # Cambio a read-only (típico post-cifrado)
+            if hasattr(event, 'mode') and event.mode == 0o400:
+                score += 2
+                indicators.append("readonly_chmod")
+        
+        # Bonus por co-ocurrencia temporal
+        # Verificar eventos recientes del mismo PID
+        recent_deletions = len(self.deletion_windows.get(pid, []))
+        recent_chmods = len(self.chmod_windows.get(pid, []))
+        
+        if recent_deletions > 3 and event.event_type in ["OPEN", "WRITE"]:
+            score += 2
+            indicators.append("deletion_cooccurrence")
+            
+        if recent_chmods > 2 and event.event_type == "UNLINK":
+            score += 1
+            indicators.append("chmod_cooccurrence")
+        
+        # Umbral de detección
+        if score >= 7:  # Umbral alto para reducir falsos positivos
+            indicators_str = ", ".join(indicators)
+            return f"RANSOMWARE COMPUESTO: Score {score} [{indicators_str}] (PID {pid})"
+        
+        return None    
+        
     def print_stats(self):
         """Mostrar estadísticas en tiempo real con DEBUG WRITE"""
         try:
@@ -619,10 +950,10 @@ class ThreatDetectorFixed:
             active_write_pids = len(self.write_counters['ops'])
             
             print(f"Eventos: {self.stats['total_events']} | "
-                  f"Alertas: {total_alerts} | "
-                  f"WRITE: {self.stats['write_events']}({self.stats['write_alerts']} alertas) | "
-                  f"PIDs activos: {active_write_pids} | "
-                  f"Rate: {rate:.1f}/s", file=sys.stderr)
+                f"Alertas: {total_alerts} | "
+                f"WRITE: {self.stats['write_events']}({self.stats['write_alerts']} alertas) | "
+                f"PIDs activos: {active_write_pids} | "
+                f"Rate: {rate:.1f}/s", file=sys.stderr)
         except Exception:
             pass
     
@@ -711,7 +1042,17 @@ class ThreatDetectorFixed:
         else:
             print(f"    Pocos eventos WRITE para evaluar ({self.stats['write_events']})", file=sys.stderr)
         
+        
+        print(f"\n📊 NUEVAS SYSCALLS:", file=sys.stderr)
+        print(f"   Eventos UNLINK: {self.stats['unlink_events']}", file=sys.stderr)
+        print(f"   Eventos CHMOD: {self.stats['chmod_events']}", file=sys.stderr)
+        print(f"   Borrados masivos detectados: {self.stats['mass_deletions_detected']}", file=sys.stderr)
+        print(f"   Escalaciones de privilegios: {self.stats['privilege_escalations_detected']}", file=sys.stderr)
+        print(f"   Patrones ransomware: {self.stats['ransomware_deletion_patterns']}", file=sys.stderr)
+        
         print("="*60, file=sys.stderr)
+         
+
 
 def main():
     """Función principal CORREGIDA"""
@@ -724,10 +1065,10 @@ def main():
     print("   • Anti-spam menos agresivo", file=sys.stderr)
     print("   • Reset cada 60s (menos frecuente)", file=sys.stderr)
     print("   • Esquema DB corregido automáticamente", file=sys.stderr)
+    print("   • ERROR SINTAXIS ARREGLADO", file=sys.stderr)
     print("Configuración:", file=sys.stderr)
     print(f"   WRITE umbral: >{detector.config['write_ops_threshold']} ops o >{detector.config['write_bytes_threshold']//1024//1024}MB", file=sys.stderr)
     print(f"   Reset interval: {detector.config['write_reset_interval']}s", file=sys.stderr)
-    print("-" * 60, file=sys.stderr)
     
     line_count = 0
     

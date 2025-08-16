@@ -50,7 +50,7 @@ struct event_t {
     u32 ppid;
     u32 uid;
     u32 gid;
-    u32 type;  // 0=EXEC, 1=OPEN, 2=WRITE, 3=UNLINK, 4=CHMOD
+    u32 type;  // 0=EXEC, 1=OPEN, 2=WRITE, 3=UNLINK, 4=CHMOD, 5=CONNECT, 6=PTRACE, 7=MMAP, 8=CHOWN
     char comm[TASK_COMM_LEN];
     char filename[256];
     u32 flags;
@@ -188,6 +188,74 @@ TRACEPOINT_PROBE(syscalls, sys_enter_fchmodat) {
     events.perf_submit(args, &data, sizeof(data));
     return 0;
 }
+
+// NUEVA SYSCALL: connect
+TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
+    struct event_t data = {};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data.type = 5;
+    data.pid = pid_tgid >> 32;
+    data.ppid = get_ppid();
+    data.flags = 0;
+    u64 uid_gid = bpf_get_current_uid_gid();
+    data.uid = uid_gid & 0xFFFFFFFF;
+    data.gid = uid_gid >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    data.filename[0] = '\0';
+    events.perf_submit(args, &data, sizeof(data));
+    return 0;
+}
+
+// NUEVA SYSCALL: ptrace
+TRACEPOINT_PROBE(syscalls, sys_enter_ptrace) {
+    struct event_t data = {};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data.type = 6;
+    data.pid = pid_tgid >> 32;
+    data.ppid = get_ppid();
+    data.flags = args->request;
+    u64 uid_gid = bpf_get_current_uid_gid();
+    data.uid = uid_gid & 0xFFFFFFFF;
+    data.gid = uid_gid >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    data.filename[0] = '\0';
+    events.perf_submit(args, &data, sizeof(data));
+    return 0;
+}
+
+// NUEVA SYSCALL: mmap
+TRACEPOINT_PROBE(syscalls, sys_enter_mmap) {
+    struct event_t data = {};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data.type = 7;
+    data.pid = pid_tgid >> 32;
+    data.ppid = get_ppid();
+    data.flags = args->prot;
+    u64 uid_gid = bpf_get_current_uid_gid();
+    data.uid = uid_gid & 0xFFFFFFFF;
+    data.gid = uid_gid >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    data.filename[0] = '\0';
+    events.perf_submit(args, &data, sizeof(data));
+    return 0;
+}
+
+// NUEVA SYSCALL: chown
+TRACEPOINT_PROBE(syscalls, sys_enter_fchownat) {
+    struct event_t data = {};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data.type = 8;
+    data.pid = pid_tgid >> 32;
+    data.ppid = get_ppid();
+    data.flags = args->user;
+    u64 uid_gid = bpf_get_current_uid_gid();
+    data.uid = uid_gid & 0xFFFFFFFF;
+    data.gid = uid_gid >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    bpf_probe_read_user_str(&data.filename, sizeof(data.filename), (void*)args->filename);
+    events.perf_submit(args, &data, sizeof(data));
+    return 0;
+}
 """
 
 # Mapeo de tipos
@@ -196,7 +264,11 @@ TYPE_STR = {
     1: "OPEN", 
     2: "WRITE",
     3: "UNLINK",
-    4: "CHMOD"
+    4: "CHMOD",
+    5: "CONNECT",
+    6: "PTRACE", 
+    7: "MMAP",
+    8: "CHOWN"
 }
 
 # Contadores
@@ -204,6 +276,10 @@ write_event_count = 0
 total_write_bytes = 0
 unlink_event_count = 0
 chmod_event_count = 0
+connect_event_count = 0
+ptrace_event_count = 0
+mmap_event_count = 0
+chown_event_count = 0
 
 def terminate_malicious_process(pid, malware_info):
     """Terminar proceso malicioso"""
@@ -253,10 +329,30 @@ def decode_chmod_mode(mode):
     
     return result
 
+def decode_ptrace_request(request):
+    """Decodificar request de ptrace"""
+    PTRACE_REQUESTS = {
+        0: "TRACEME", 1: "PEEKTEXT", 2: "PEEKDATA", 3: "PEEKUSER",
+        4: "POKETEXT", 5: "POKEDATA", 6: "POKEUSER", 7: "CONT",
+        8: "KILL", 9: "SINGLESTEP", 12: "GETREGS", 13: "SETREGS",
+        16: "ATTACH", 17: "DETACH", 24: "SYSCALL"
+    }
+    return PTRACE_REQUESTS.get(request, f"UNKNOWN({request})")
+
+def decode_mmap_prot(prot):
+    """Decodificar protección de mmap"""
+    flags = []
+    if prot & 0x1: flags.append("READ")
+    if prot & 0x2: flags.append("WRITE") 
+    if prot & 0x4: flags.append("EXEC")
+    if not flags: flags.append("NONE")
+    return "|".join(flags)
+
 def handle_event(cpu, data, size):
     """Procesar eventos"""
     global hash_engine, write_event_count, total_write_bytes
     global unlink_event_count, chmod_event_count
+    global connect_event_count, ptrace_event_count, mmap_event_count, chown_event_count
     
     try:
         event = b["events"].event(data)
@@ -337,6 +433,56 @@ def handle_event(cpu, data, size):
             
             if chmod_event_count % 20 == 0:
                 print(f"DEBUG: {chmod_event_count} permission changes", file=sys.stderr)
+        
+        elif event.type == 5:  # CONNECT
+            output["operation"] = "NETWORK_CONNECT"
+            connect_event_count += 1
+            
+            # Detectar conexiones sospechosas
+            if event.uid != 0:  # Procesos no-root haciendo conexiones
+                output["suspicious_connect"] = True
+                output["reason"] = "Non-root network connection"
+            
+            if connect_event_count % 30 == 0:
+                print(f"DEBUG: {connect_event_count} network connections", file=sys.stderr)
+
+        elif event.type == 6:  # PTRACE
+            output["ptrace_request"] = event.flags
+            output["ptrace_decoded"] = decode_ptrace_request(event.flags)
+            ptrace_event_count += 1
+            
+            # Todos los ptrace son sospechosos
+            output["suspicious_ptrace"] = True
+            output["reason"] = f"Process debugging/injection: {output['ptrace_decoded']}"
+            
+            if ptrace_event_count % 10 == 0:
+                print(f"DEBUG: {ptrace_event_count} ptrace calls", file=sys.stderr)
+
+        elif event.type == 7:  # MMAP
+            output["mmap_prot"] = event.flags
+            output["mmap_decoded"] = decode_mmap_prot(event.flags)
+            mmap_event_count += 1
+            
+            # Detectar WRITE+EXEC (code injection)
+            if (event.flags & 0x2) and (event.flags & 0x4):  # WRITE + EXEC
+                output["suspicious_mmap"] = True
+                output["reason"] = "Executable memory mapping"
+            
+            if mmap_event_count % 50 == 0:
+                print(f"DEBUG: {mmap_event_count} memory mappings", file=sys.stderr)
+
+        elif event.type == 8:  # CHOWN
+            output["path"] = filename
+            output["new_owner"] = event.flags
+            chown_event_count += 1
+            
+            # Detectar cambios de ownership sospechosos
+            if event.uid != 0 and event.flags == 0:  # No-root cambiando a root
+                output["suspicious_chown"] = True
+                output["reason"] = "Ownership change to root"
+            
+            if chown_event_count % 20 == 0:
+                print(f"DEBUG: {chown_event_count} ownership changes", file=sys.stderr)
 
         # Filtro de ruido
         if event.type == 2 and comm in ("tee", "cat"):
@@ -381,6 +527,10 @@ def main():
         print("     • write - Escritura (>1KB)", file=sys.stderr)
         print("     • unlink/unlinkat - Borrado de archivos", file=sys.stderr)
         print("     • chmod/fchmodat - Cambios de permisos", file=sys.stderr)
+        print("     • connect - Conexiones de red", file=sys.stderr)
+        print("     • ptrace - Debugging/inyección", file=sys.stderr)
+        print("     • mmap - Mapeo de memoria", file=sys.stderr)
+        print("     • chown - Cambio de propietario", file=sys.stderr)
 
     if not args.no_hash and HASH_DETECTION_AVAILABLE:
         hash_engine = HashDetectionEngine()
@@ -395,7 +545,7 @@ def main():
 
         if args.verbose:
             print("✓ eBPF compilado exitosamente", file=sys.stderr)
-            print("Monitorizando syscalls (5 tipos activos)...", file=sys.stderr)
+            print("Monitorizando syscalls (9 tipos activos)...", file=sys.stderr)
             
         while True:
             b.perf_buffer_poll()
@@ -410,10 +560,13 @@ def main():
             except: 
                 pass
         if args.verbose:
-            print(f"\n📊 Estadísticas finales:", file=sys.stderr)
             print(f"   WRITE: {write_event_count} eventos, {total_write_bytes} bytes", file=sys.stderr)
             print(f"   UNLINK: {unlink_event_count} archivos borrados", file=sys.stderr)
             print(f"   CHMOD: {chmod_event_count} cambios de permisos", file=sys.stderr)
+            print(f"   CONNECT: {connect_event_count} conexiones de red", file=sys.stderr)
+            print(f"   PTRACE: {ptrace_event_count} llamadas debug", file=sys.stderr)
+            print(f"   MMAP: {mmap_event_count} mapeos memoria", file=sys.stderr)
+            print(f"   CHOWN: {chown_event_count} cambios propietario", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

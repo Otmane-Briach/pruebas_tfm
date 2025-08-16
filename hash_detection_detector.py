@@ -43,6 +43,16 @@ class Event:
     suspicious_deletion: Optional[bool] = None  # Borrado sospechoso
     suspicious_chmod: Optional[bool] = None  # Permisos peligrosos
     suspicious_reasons: Optional[List[str]] = None  # Razones de sospecha
+    # Campos para nuevas syscalls
+    ptrace_request: Optional[int] = None
+    ptrace_decoded: Optional[str] = None
+    mmap_prot: Optional[int] = None
+    mmap_decoded: Optional[str] = None
+    new_owner: Optional[int] = None
+    suspicious_connect: Optional[bool] = None
+    suspicious_ptrace: Optional[bool] = None
+    suspicious_mmap: Optional[bool] = None
+    suspicious_chown: Optional[bool] = None
 
 class ThreatDetectorFixed:
     """Detector WRITE CORREGIDO con umbrales realistas"""
@@ -91,7 +101,7 @@ class ThreatDetectorFixed:
         
         # ahora sii: Umbrales WRITE REALISTAS para testing
         self.config = {
-            "file_burst_threshold": 5,
+            "file_burst_threshold": 3,#antes 5, lo bajo Más sensible para testing
             "exec_burst_threshold": 3,
             "time_window": 10,
             # UMBRALES WRITE AJUSTADOS PARA TESTING
@@ -167,7 +177,16 @@ class ThreatDetectorFixed:
             "chmod_events": 0,
             "mass_deletions_detected": 0,
             "privilege_escalations_detected": 0,
-            "ransomware_deletion_patterns": 0
+            "ransomware_deletion_patterns": 0,
+            "connect_events": 0,
+            "ptrace_events": 0,
+            "mmap_events": 0,
+            "chown_events": 0,
+            "network_alerts": 0,
+            "injection_alerts": 0,
+            "memory_alerts": 0,
+            "ownership_alerts": 0
+
         }
         
         
@@ -191,7 +210,7 @@ class ThreatDetectorFixed:
             table_exists = cursor.fetchone() is not None
             
             if not table_exists:
-                # Crear tabla completa con TODAS las columnas incluyendo las nuevas
+                # Crear tabla completa con TODAS las columnas incluyendo las nuevas syscalls
                 self.db_conn.execute("""
                     CREATE TABLE events(
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,7 +236,16 @@ class ThreatDetectorFixed:
                         mode_decoded TEXT,
                         suspicious_deletion INTEGER,
                         suspicious_chmod INTEGER,
-                        suspicious_reasons TEXT
+                        suspicious_reasons TEXT,
+                        ptrace_request INTEGER,
+                        ptrace_decoded TEXT,
+                        mmap_prot INTEGER,
+                        mmap_decoded TEXT,
+                        new_owner INTEGER,
+                        suspicious_connect INTEGER,
+                        suspicious_ptrace INTEGER,
+                        suspicious_mmap INTEGER,
+                        suspicious_chown INTEGER
                     )
                 """)
                 print("Tabla events creada con esquema expandido (incluye UNLINK/CHMOD)", file=sys.stderr)
@@ -234,7 +262,16 @@ class ThreatDetectorFixed:
                     ("mode_decoded", "TEXT"),
                     ("suspicious_deletion", "INTEGER"),
                     ("suspicious_chmod", "INTEGER"),
-                    ("suspicious_reasons", "TEXT")
+                    ("suspicious_reasons", "TEXT"),
+                    ("ptrace_request", "INTEGER"),
+                    ("ptrace_decoded", "TEXT"),
+                    ("mmap_prot", "INTEGER"),
+                    ("mmap_decoded", "TEXT"),
+                    ("new_owner", "INTEGER"),
+                    ("suspicious_connect", "INTEGER"),
+                    ("suspicious_ptrace", "INTEGER"),
+                    ("suspicious_mmap", "INTEGER"),
+                    ("suspicious_chown", "INTEGER")
                 ]
                 
                 columns_added = []
@@ -353,6 +390,27 @@ class ThreatDetectorFixed:
                 event.suspicious_chmod = event_data.get("suspicious_chmod", False)
                 event.suspicious_reasons = event_data.get("suspicious_reasons", [])
                 self.stats["chmod_events"] += 1
+            # Procesar campos específicos de las nuevas syscalls
+            elif event_data.get("type") == "CONNECT":
+                event.suspicious_connect = event_data.get("suspicious_connect", False)
+                self.stats["connect_events"] += 1
+            
+            elif event_data.get("type") == "PTRACE":
+                event.ptrace_request = event_data.get("ptrace_request")
+                event.ptrace_decoded = event_data.get("ptrace_decoded")
+                event.suspicious_ptrace = event_data.get("suspicious_ptrace", False)
+                self.stats["ptrace_events"] += 1
+                
+            elif event_data.get("type") == "MMAP":
+                event.mmap_prot = event_data.get("mmap_prot")
+                event.mmap_decoded = event_data.get("mmap_decoded")
+                event.suspicious_mmap = event_data.get("suspicious_mmap", False)
+                self.stats["mmap_events"] += 1
+                
+            elif event_data.get("type") == "CHOWN":
+                event.new_owner = event_data.get("new_owner")
+                event.suspicious_chown = event_data.get("suspicious_chown", False)
+                self.stats["chown_events"] += 1
 
             # Actualizar estadísticas mejoradas
             self._update_stats_complete(event)
@@ -546,7 +604,17 @@ class ThreatDetectorFixed:
                 getattr(event, 'mode_decoded', None),  # Permisos decodificados
                 1 if getattr(event, 'suspicious_deletion', False) else 0,  # Boolean as int
                 1 if getattr(event, 'suspicious_chmod', False) else 0,  # Boolean as int
-                suspicious_reasons_json  # JSON array de razones
+                suspicious_reasons_json,  # JSON array de razones
+                # NUEVOS CAMPOS
+                getattr(event, 'ptrace_request', None),
+                getattr(event, 'ptrace_decoded', None),
+                getattr(event, 'mmap_prot', None),
+                getattr(event, 'mmap_decoded', None),
+                getattr(event, 'new_owner', None),
+                1 if getattr(event, 'suspicious_connect', False) else 0,
+                1 if getattr(event, 'suspicious_ptrace', False) else 0,
+                1 if getattr(event, 'suspicious_mmap', False) else 0,
+                1 if getattr(event, 'suspicious_chown', False) else 0
             )
             
             # SQL con TODOS los campos
@@ -557,9 +625,12 @@ class ThreatDetectorFixed:
                     file_hash, malware_family, malware_source, scan_method,
                     uid, gid, bytes_written,
                     operation, mode, mode_decoded, 
-                    suspicious_deletion, suspicious_chmod, suspicious_reasons
+                    suspicious_deletion, suspicious_chmod, suspicious_reasons,
+                    ptrace_request, ptrace_decoded, mmap_prot, mmap_decoded,
+                    new_owner, suspicious_connect, suspicious_ptrace,
+                    suspicious_mmap, suspicious_chown
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, values)
             
             # Commit cada 50 eventos para performance
@@ -630,7 +701,27 @@ class ThreatDetectorFixed:
         if alert:
             self.stats["alerts_by_type"]["ransomware_composite"] += 1
             return alert
+        # NUEVAS DETECCIONES
+        alert = self._check_network_suspicious(event)
+        if alert:
+            self.stats["alerts_by_type"]["network_suspicious"] += 1
+            return alert
             
+        alert = self._check_process_injection(event)
+        if alert:
+            self.stats["alerts_by_type"]["process_injection"] += 1
+            return alert
+            
+        alert = self._check_memory_execution(event)
+        if alert:
+            self.stats["alerts_by_type"]["memory_execution"] += 1
+            return alert
+            
+        alert = self._check_ownership_manipulation(event)
+        if alert:
+            self.stats["alerts_by_type"]["ownership_manipulation"] += 1
+            return alert
+
         return None
     
     # MANTENER TODAS LAS FUNCIONES EXISTENTES SIN CAMBIOS
@@ -656,8 +747,7 @@ class ThreatDetectorFixed:
         return None
     
     def _check_file_burst_antispam(self, event: Event) -> Optional[str]:
-        """Detección de ráfagas de archivos CON ANTI-SPAM GLOBAL, Solo cuenta si el OPEN tiene 
-        O_CREAT y la extensión es sospechosa (.locked, .encrypted, etc.) en una ventana de tiempo"""
+        """Detección de ráfagas de archivos CON ANTI-SPAM GLOBAL"""
         if event.event_type != "OPEN":
             return None
             
@@ -675,13 +765,13 @@ class ThreatDetectorFixed:
         window = self.file_windows[pid]
         while window and current_time - window[0] > self.config["time_window"]:
             window.popleft()
-
-        #Así, al terminar el bucle, window contiene solo los eventos de los últimos N segundos
-        # (N = time_window). Luego comparas len(window) con el umbral (file_burst_threshold) para
-        # decidir si hay ráfag    
             
         # Añadir evento
         window.append(current_time)
+        
+        # DEBUG TEMPORAL para ransomware
+        if event.path and event.path.endswith('.locked'):
+            print(f"DEBUG RANSOMWARE: PID {pid}, window size: {len(window)}, threshold: {self.config['file_burst_threshold']}, path: {event.path}", file=sys.stderr)
         
         # Verificar umbral
         if len(window) >= self.config["file_burst_threshold"]:
@@ -935,11 +1025,57 @@ class ThreatDetectorFixed:
             indicators.append("chmod_cooccurrence")
         
         # Umbral de detección
-        if score >= 7:  # Umbral alto para reducir falsos positivos
+        if score >= 4:  # Umbral alto para reducir falsos positivos
             indicators_str = ", ".join(indicators)
             return f"RANSOMWARE COMPUESTO: Score {score} [{indicators_str}] (PID {pid})"
         
         return None    
+
+    def _check_network_suspicious(self, event: Event) -> Optional[str]:
+        """Detectar conexiones de red sospechosas"""
+        if event.event_type != "CONNECT":
+            return None
+            
+        if event.suspicious_connect:
+            self.stats["network_alerts"] += 1
+            return f"CONEXIÓN SOSPECHOSA: Proceso no-root {event.comm} (PID {event.pid})"
+        
+        return None
+    
+    def _check_process_injection(self, event: Event) -> Optional[str]:
+        """Detectar inyección de procesos via ptrace"""
+        if event.event_type != "PTRACE":
+            return None
+            
+        dangerous_requests = ["ATTACH", "POKETEXT", "POKEDATA", "SETREGS"]
+        
+        if event.ptrace_decoded and any(req in event.ptrace_decoded for req in dangerous_requests):
+            self.stats["injection_alerts"] += 1
+            return f"INYECCIÓN PROCESO: {event.ptrace_decoded} por {event.comm} (PID {event.pid})"
+        
+        return None
+    
+    def _check_memory_execution(self, event: Event) -> Optional[str]:
+        """Detectar ejecución en memoria (code injection)"""
+        if event.event_type != "MMAP":
+            return None
+            
+        if event.suspicious_mmap:
+            self.stats["memory_alerts"] += 1
+            return f"EJECUCIÓN MEMORIA: {event.mmap_decoded} por {event.comm} (PID {event.pid})"
+        
+        return None
+    
+    def _check_ownership_manipulation(self, event: Event) -> Optional[str]:
+        """Detectar manipulación de propietarios"""
+        if event.event_type != "CHOWN":
+            return None
+            
+        if event.suspicious_chown:
+            self.stats["ownership_alerts"] += 1
+            return f"CAMBIO PROPIETARIO SOSPECHOSO: a UID {event.new_owner} por {event.comm} (PID {event.pid})"
+        
+        return None
         
     def print_stats(self):
         """Mostrar estadísticas en tiempo real con DEBUG WRITE"""
@@ -1049,6 +1185,14 @@ class ThreatDetectorFixed:
         print(f"   Borrados masivos detectados: {self.stats['mass_deletions_detected']}", file=sys.stderr)
         print(f"   Escalaciones de privilegios: {self.stats['privilege_escalations_detected']}", file=sys.stderr)
         print(f"   Patrones ransomware: {self.stats['ransomware_deletion_patterns']}", file=sys.stderr)
+        print(f"   Eventos CONNECT: {self.stats['connect_events']}", file=sys.stderr)
+        print(f"   Eventos PTRACE: {self.stats['ptrace_events']}", file=sys.stderr)
+        print(f"   Eventos MMAP: {self.stats['mmap_events']}", file=sys.stderr)
+        print(f"   Eventos CHOWN: {self.stats['chown_events']}", file=sys.stderr)
+        print(f"   Alertas de red: {self.stats['network_alerts']}", file=sys.stderr)
+        print(f"   Alertas de inyección: {self.stats['injection_alerts']}", file=sys.stderr)
+        print(f"   Alertas de memoria: {self.stats['memory_alerts']}", file=sys.stderr)
+        print(f"   Alertas de ownership: {self.stats['ownership_alerts']}", file=sys.stderr)
         
         print("="*60, file=sys.stderr)
          

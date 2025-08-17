@@ -54,6 +54,99 @@ class Event:
     suspicious_mmap: Optional[bool] = None
     suspicious_chown: Optional[bool] = None
 
+class ProcessScoreTracker:
+    """Sistema de scoring unificado basado en ESCAPADE/LeARN"""
+    
+    def __init__(self):
+        self.process_scores = defaultdict(lambda: {
+            'score': 0,
+            'indicators': [],
+            'last_update': 0,
+            'window_events': deque()
+        })
+        
+        # Scoring EXACTO según tu documento a Florina
+        self.scoring_rules = {
+            # +3 PUNTOS: Alta prevalencia (>80%) y especificidad (<2% FP)
+            'locked_files_burst': 3,      # >5 archivos .locked en 10s
+            'massive_write': 3,            # >20MB o >50 ops
+            'unlink_burst': 3,             # >5 deletes en 10s
+            'ransom_note': 3,              # Drop HTML/RTF
+            
+            # +2 PUNTOS: Prevalencia media (50-80%) y especificidad media (2-5% FP)
+            'tmp_execution': 2,            # Ejecución desde /tmp
+            'kill_process': 2,             # pkill/kill
+            'setuid_chmod': 2,             # chmod SETUID/SETGID
+            
+            # +1 PUNTO: Baja prevalencia (<50%) y especificidad (>5% FP)
+            'chmod_regular': 1,            # chmod normal
+            'mmap_exec': 1,                # mmap WRITE+EXEC
+            'ptrace_use': 1,               # ptrace
+            'o_trunc': 1,                  # O_TRUNC flag
+            
+            # +1 BONUS: Co-ocurrencia
+            'cooccurrence': 1              # Múltiples indicadores juntos
+        }
+        
+        self.alert_threshold = 6  # Umbral según tu documento
+        self.time_window = 10      # Ventana de 10 segundos
+        self.alerted_pids = set()  # Anti-spam
+    
+    def add_indicator(self, pid: int, indicator: str, event_time: float, verbose: bool = False) -> Optional[str]:
+        """Actualizar score y verificar umbral"""
+        proc = self.process_scores[pid]
+        
+        # Limpiar eventos fuera de ventana CORRECTAMENTE
+        new_window = deque()
+        for e in proc['window_events']:
+            if event_time - e[0] <= self.time_window:
+                new_window.append(e)
+        proc['window_events'] = new_window
+        
+        # En ProcessScoreTracker.add_indicator(), después de la limpieza de ventana:
+        if indicator == 'o_trunc':
+            o_trunc_count = sum(1 for e in proc['window_events'] if e[1] == 'o_trunc')
+            if o_trunc_count >= 3:
+                return None  # Máximo 3 o_trunc por ventana
+
+        # Anti-spam: no añadir el mismo indicador más de una vez por ventana
+        # (excepto o_trunc que puede acumularse)
+        if indicator != 'o_trunc':
+            recent_indicators = [e[1] for e in proc['window_events']]
+            if indicator in recent_indicators:
+                return None  # Ya existe este indicador, no duplicar
+        
+        # Añadir nuevo evento
+        points = self.scoring_rules.get(indicator, 0)
+        if points > 0:
+            proc['window_events'].append((event_time, indicator, points))
+            proc['last_update'] = event_time
+            
+            # Calcular score actual
+            current_score = sum(e[2] for e in proc['window_events'])
+            
+            # NUEVO: Log de trazabilidad
+            if verbose or current_score >= 4:  # Log si verbose o cerca del umbral
+                indicators_list = [f"{e[1]}(+{e[2]})" for e in proc['window_events']]
+                print(f"SCORING PID {pid}: {current_score}/6 pts [{', '.join(indicators_list)}]", file=sys.stderr)
+            
+            # Check co-ocurrencia bonus
+            unique_indicators = set(e[1] for e in proc['window_events'])
+            if len(unique_indicators) >= 3:
+                current_score += self.scoring_rules['cooccurrence']
+                if verbose:
+                    print(f"  +1 bonus co-ocurrencia → {current_score}/6", file=sys.stderr)
+            
+            # Verificar umbral
+            if current_score >= self.alert_threshold and pid not in self.alerted_pids:
+                self.alerted_pids.add(pid)
+                indicators = [f"{e[1]}(+{e[2]})" for e in proc['window_events']]
+                # Limpiar ventana después de alertar
+                proc['window_events'].clear()
+                return f"RANSOMWARE [SCORE {current_score}]: {', '.join(indicators)} (PID {pid})"
+        
+        return None
+
 class ThreatDetectorFixed:
     """Detector WRITE CORREGIDO con umbrales realistas"""
     
@@ -63,6 +156,10 @@ class ThreatDetectorFixed:
         # Ventanas de tiempo (existentes)
         self.file_windows = defaultdict(deque)
         self.exec_windows = defaultdict(deque)
+
+        # Sistema de scoring unificado
+        self.score_tracker = ProcessScoreTracker()
+        self.verbose_scoring = os.environ.get('EDR_VERBOSE_SCORING', '0') == '1'
         
         # Ventanas para nuevas syscalls
         self.deletion_windows = defaultdict(deque)  # Ventana para UNLINK
@@ -101,7 +198,7 @@ class ThreatDetectorFixed:
         
         # ahora sii: Umbrales WRITE REALISTAS para testing
         self.config = {
-            "file_burst_threshold": 3,#antes 5, lo bajo Más sensible para testing
+            "file_burst_threshold": 5,# >5 archivos .locked según documento ESCAPADE/LeARN
             "exec_burst_threshold": 3,
             "time_window": 10,
             # UMBRALES WRITE AJUSTADOS PARA TESTING
@@ -516,26 +613,16 @@ class ThreatDetectorFixed:
         alert_triggered = False
         alert_msg = None
         
-        # Umbral de operaciones (REALISTA)
-        if ops >= self.config['write_ops_threshold']:
-            alert_msg = f"ESCRITURA INTENSIVA: {ops} operaciones, {bytes_total:,} bytes (PID {pid})"
-            alert_triggered = True
-            print(f"DEBUG: Alerta por OPERACIONES - PID {pid}: {ops} >= {self.config['write_ops_threshold']}", file=sys.stderr)
-        
-        # Umbral de bytes (REALISTA)
-        elif bytes_total >= self.config['write_bytes_threshold']:
-            alert_msg = f"ESCRITURA MASIVA: {bytes_total:,} bytes en {ops} operaciones (PID {pid})"
-            alert_triggered = True
-            print(f"DEBUG: Alerta por BYTES - PID {pid}: {bytes_total:,} >= {self.config['write_bytes_threshold']:,}", file=sys.stderr)
-        
-        if alert_triggered:
-            # Marcar PID como alertado
-            self.write_alerted.add(pid)
-            self.write_last_alert[pid] = current_time
-            self.stats["write_alerts"] += 1
-            print(f"DEBUG: ALERTA WRITE GENERADA - PID {pid}, total alertas: {self.stats['write_alerts']}", file=sys.stderr)
-            return alert_msg
-        
+        # Verificar umbrales y añadir al scoring
+        if ops >= 50 or bytes_total >= 20*1024*1024:  # Umbrales según tu doc
+            alert = self.score_tracker.add_indicator(pid, 'massive_write', current_time, verbose=self.verbose_scoring)
+            if alert:
+                self.write_alerted.add(pid)
+                self.write_last_alert[pid] = current_time
+                self.stats["write_alerts"] += 1
+                print(f"DEBUG: ALERTA SCORING WRITE - PID {pid}", file=sys.stderr)
+                return alert
+
         return None
 
     def _update_stats_complete(self, event: Event):
@@ -697,10 +784,7 @@ class ThreatDetectorFixed:
             self.stats["alerts_by_type"]["privilege_escalation"] += 1
             return alert
         
-        alert = self._check_ransomware_pattern_composite(event)
-        if alert:
-            self.stats["alerts_by_type"]["ransomware_composite"] += 1
-            return alert
+        
         # NUEVAS DETECCIONES
         alert = self._check_network_suspicious(event)
         if alert:
@@ -747,47 +831,32 @@ class ThreatDetectorFixed:
         return None
     
     def _check_file_burst_antispam(self, event: Event) -> Optional[str]:
-        """Detección de ráfagas de archivos CON ANTI-SPAM GLOBAL"""
+        """Detección de archivos .locked con SCORING CORRECTO"""
         if event.event_type != "OPEN":
             return None
             
         if not event.flags or not (event.flags & 0x40):  # O_CREAT
             return None
         
-        # Requerir extensión de ransomware para reducir falsos positivos
+        # Verificar extensión ransomware
         if not (event.path and any(event.path.endswith(ext) for ext in self.config["suspicious_extensions"])):
             return None
-
+        
         current_time = event.timestamp
         pid = event.pid
         
-        # Limpiar ventana
+        # Actualizar ventana para contar burst
         window = self.file_windows[pid]
-        while window and current_time - window[0] > self.config["time_window"]:
+        while window and current_time - window[0] > 10:  # Ventana de 10s según tu doc
             window.popleft()
-            
-        # Añadir evento
         window.append(current_time)
         
-        # DEBUG TEMPORAL para ransomware
-        if event.path and event.path.endswith('.locked'):
-            print(f"DEBUG RANSOMWARE: PID {pid}, window size: {len(window)}, threshold: {self.config['file_burst_threshold']}, path: {event.path}", file=sys.stderr)
+        # Si hay >5 archivos .locked en 10s → +3 puntos
+        if len(window) >= self.config["file_burst_threshold"]:  # Umbral según tu documento
+            alert = self.score_tracker.add_indicator(pid, 'locked_files_burst', current_time, verbose=self.verbose_scoring)
+            if alert:
+                return alert
         
-        # Verificar umbral
-        if len(window) >= self.config["file_burst_threshold"]:
-            # Anti-spam por PID
-            if pid not in self.ransomware_alerted:
-                # Anti-spam por directorio (cooldown global)
-                dirpath = os.path.dirname(event.path) if event.path else "/tmp"
-                last_alert = self.ransomware_dir_alerted.get(dirpath, 0)
-                
-                if current_time - last_alert > self.ransomware_cooldown:
-                    self.ransomware_alerted.add(pid)
-                    self.ransomware_dir_alerted[dirpath] = current_time
-                    return f"RANSOMWARE DETECTADO: {len(window)} archivos creados en {self.config['time_window']}s (PID {pid}, DIR {dirpath})"
-                else:
-                    self.ransomware_alerted.add(pid)
-            
         return None
     
     def _check_exec_burst(self, event: Event) -> Optional[str]:
@@ -810,55 +879,32 @@ class ThreatDetectorFixed:
         return None
     
     def _check_suspicious_locations_improved(self, event: Event) -> Optional[str]:
-        """Detección de ubicaciones sospechosas MEJORADA con scoring"""
-        if event.event_type != "OPEN" or not event.path:
+        """Detección /tmp con SCORING CORRECTO"""
+        if event.event_type not in ["OPEN", "EXEC"]:
             return None
             
-        # Verificar ubicación sospechosa
-        is_suspicious_location = False
+        if not event.path:
+            return None
+            
+        # Verificar si es /tmp o similar
         for suspicious_path in self.config["suspicious_paths"]:
             if event.path.startswith(suspicious_path):
-                is_suspicious_location = True
-                break
+                # Ejecución desde /tmp → +2 puntos
+                if event.event_type == "EXEC":
+                    alert = self.score_tracker.add_indicator(
+                        event.pid, 'tmp_execution', event.timestamp, verbose=self.verbose_scoring
+                    )
+                    if alert:
+                        return alert
                 
-        if not is_suspicious_location:
-            return None
-            
-        # Scoring system
-        score = 0
-        reasons = []
-        
-        # +2 puntos: Archivo en ubicación sospechosa
-        score += 2
-        reasons.append("ubicación sospechosa")
-        
-        # +3 puntos: Flag CREATE
-        if event.flags and event.flags & 0x40:  # O_CREAT
-            score += 3
-            reasons.append("creación de archivo")
-            
-        # +2 puntos: Extensión sospechosa
-        if any(event.path.endswith(ext) for ext in self.config["suspicious_extensions"]):
-            score += 2
-            reasons.append("extensión de ransomware")
-            
-        # +1 punto: Flag TRUNC (sobreescritura)
-        if event.flags and event.flags & 0x200:  # O_TRUNC
-            score += 1
-            reasons.append("sobreescritura")
-            
-        # Alertar solo si score >= 4 y no hemos alertado ya este PID
-        if score >= 4:
-            pid = event.pid
-            if pid not in self.suspicious_location_alerted:
-                self.suspicious_location_alerted.add(pid)
-                reason_str = ", ".join(reasons)
-                return f"Archivo en ubicación sospechosa: {event.path} (Score: {score} - {reason_str})"
-            
-        # Score bajo: alerta simple
-        elif score >= 2:
-            return f"Archivo en ubicación sospechosa: {event.path}"
-            
+                # O_TRUNC → +1 punto
+                if event.flags and event.flags & 0x200:
+                    alert = self.score_tracker.add_indicator(
+                        event.pid, 'o_trunc', event.timestamp, verbose=self.verbose_scoring
+                    )
+                    if alert:
+                        return alert
+                        
         return None
     
 
@@ -901,10 +947,12 @@ class ThreatDetectorFixed:
                     break
         
         # DETECCIÓN 1: Ráfaga de borrados
-        if len(window) >= self.config["deletion_burst_threshold"]:
-            self.mass_deletion_alerted.add(pid)
-            self.stats["mass_deletions_detected"] += 1
-            return f"BORRADO MASIVO: {len(window)} archivos eliminados en {self.config['deletion_time_window']}s (PID {pid})"
+        if len(window) >= 5:  # >5 en 10s según tu documento
+            alert = self.score_tracker.add_indicator(pid, 'unlink_burst', current_time, verbose=self.verbose_scoring)
+            if alert:
+                self.mass_deletion_alerted.add(pid)
+                self.stats["mass_deletions_detected"] += 1
+                return alert
         
         # DETECCIÓN 2: Borrado de archivos críticos
         user_files_deleted = self.deletion_patterns['user_files'][pid]
@@ -960,11 +1008,17 @@ class ThreatDetectorFixed:
         window.append(current_time)
         
         # DETECCIÓN: Múltiples cambios sospechosos
-        if len(window) >= self.config["chmod_suspicious_threshold"]:
+        if "SETUID" in suspicious_perms or "SETGID" in suspicious_perms:
+            # SETUID/SETGID → +2 puntos
+            alert = self.score_tracker.add_indicator(pid, 'setuid_chmod', current_time, verbose=self.verbose_scoring)
+        else:
+            # chmod regular → +1 punto
+            alert = self.score_tracker.add_indicator(pid, 'chmod_regular', current_time, verbose=self.verbose_scoring)
+
+        if alert:
             self.privilege_escalation_alerted.add(pid)
             self.stats["privilege_escalations_detected"] += 1
-            perms_str = ", ".join(suspicious_perms)
-            return f"ESCALACIÓN PRIVILEGIOS: {len(window)} cambios sospechosos [{perms_str}] (PID {pid})"
+            return alert
         
         # Alerta individual para SETUID/SETGID
         if "SETUID" in suspicious_perms or "SETGID" in suspicious_perms:
@@ -973,63 +1027,7 @@ class ThreatDetectorFixed:
         
         return None
 
-    def _check_ransomware_pattern_composite(self, event: Event) -> Optional[str]:
-        """
-        Detección compuesta: CREATE + WRITE + DELETE pattern
-        Score-based detection inspirado en ESCAPADe paper
-        """
-        pid = event.pid
-        current_time = event.timestamp
-        
-        # Calcular score compuesto
-        score = 0
-        indicators = []
-        
-        # Score por tipo de evento
-        if event.event_type == "UNLINK":
-            # Verificar si es archivo de usuario
-            if event.path and any(event.path.endswith(ext) for ext in self.config["critical_extensions"]):
-                score += 3
-                indicators.append("user_file_deletion")
-                
-        elif event.event_type == "OPEN":
-            # Verificar creación con extensión sospechosa
-            if event.flags and (event.flags & 0x40):  # O_CREAT
-                if event.path and any(event.path.endswith(ext) for ext in self.config["suspicious_extensions"]):
-                    score += 4
-                    indicators.append("ransomware_extension")
-                    
-        elif event.event_type == "WRITE":
-            # Escritura intensiva
-            if event.bytes_written and event.bytes_written > 10*1024*1024:  # >10MB
-                score += 2
-                indicators.append("large_write")
-                
-        elif event.event_type == "CHMOD":
-            # Cambio a read-only (típico post-cifrado)
-            if hasattr(event, 'mode') and event.mode == 0o400:
-                score += 2
-                indicators.append("readonly_chmod")
-        
-        # Bonus por co-ocurrencia temporal
-        # Verificar eventos recientes del mismo PID
-        recent_deletions = len(self.deletion_windows.get(pid, []))
-        recent_chmods = len(self.chmod_windows.get(pid, []))
-        
-        if recent_deletions > 3 and event.event_type in ["OPEN", "WRITE"]:
-            score += 2
-            indicators.append("deletion_cooccurrence")
-            
-        if recent_chmods > 2 and event.event_type == "UNLINK":
-            score += 1
-            indicators.append("chmod_cooccurrence")
-        
-        # Umbral de detección
-        if score >= 4:  # Umbral alto para reducir falsos positivos
-            indicators_str = ", ".join(indicators)
-            return f"RANSOMWARE COMPUESTO: Score {score} [{indicators_str}] (PID {pid})"
-        
-        return None    
+    
 
     def _check_network_suspicious(self, event: Event) -> Optional[str]:
         """Detectar conexiones de red sospechosas"""
@@ -1043,27 +1041,32 @@ class ThreatDetectorFixed:
         return None
     
     def _check_process_injection(self, event: Event) -> Optional[str]:
-        """Detectar inyección de procesos via ptrace"""
+        """Detectar inyección con scoring"""
         if event.event_type != "PTRACE":
             return None
-            
-        dangerous_requests = ["ATTACH", "POKETEXT", "POKEDATA", "SETREGS"]
         
-        if event.ptrace_decoded and any(req in event.ptrace_decoded for req in dangerous_requests):
+        # ptrace → +1 punto
+        alert = self.score_tracker.add_indicator(
+            event.pid, 'ptrace_use', event.timestamp, verbose=self.verbose_scoring
+        )
+        if alert:
             self.stats["injection_alerts"] += 1
-            return f"INYECCIÓN PROCESO: {event.ptrace_decoded} por {event.comm} (PID {event.pid})"
-        
+            return alert
         return None
     
     def _check_memory_execution(self, event: Event) -> Optional[str]:
-        """Detectar ejecución en memoria (code injection)"""
+        """Detectar ejecución en memoria con scoring"""
         if event.event_type != "MMAP":
             return None
             
         if event.suspicious_mmap:
-            self.stats["memory_alerts"] += 1
-            return f"EJECUCIÓN MEMORIA: {event.mmap_decoded} por {event.comm} (PID {event.pid})"
-        
+            # mmap WRITE+EXEC → +1 punto
+            alert = self.score_tracker.add_indicator(
+                event.pid, 'mmap_exec', event.timestamp, verbose=self.verbose_scoring
+            )
+            if alert:
+                self.stats["memory_alerts"] += 1
+                return alert
         return None
     
     def _check_ownership_manipulation(self, event: Event) -> Optional[str]:
@@ -1194,6 +1197,13 @@ class ThreatDetectorFixed:
         print(f"   Alertas de memoria: {self.stats['memory_alerts']}", file=sys.stderr)
         print(f"   Alertas de ownership: {self.stats['ownership_alerts']}", file=sys.stderr)
         
+        print(f"\n🎯 SISTEMA DE SCORING UNIFICADO:", file=sys.stderr)
+        print(f"   Umbral configurado: >{self.score_tracker.alert_threshold} puntos", file=sys.stderr)
+        print(f"   Ventana temporal: {self.score_tracker.time_window}s", file=sys.stderr)
+        print(f"   PIDs que alcanzaron umbral: {len(self.score_tracker.alerted_pids)}", file=sys.stderr)
+        if self.verbose_scoring:
+            print(f"   Modo verbose: ACTIVO", file=sys.stderr)
+
         print("="*60, file=sys.stderr)
          
 

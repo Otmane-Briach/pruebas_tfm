@@ -1,8 +1,8 @@
 #!/bin/bash
-# test_full_system.sh - Test completo del sistema EDR con TODAS las syscalls expandidas
+# testing_sistema_scoring.sh - Test específico del sistema de scoring ESCAPADE/LeARN
 
 echo "================================================"
-echo "    TEST COMPLETO EDR - TODAS LAS SYSCALLS     "
+echo "  TEST SISTEMA SCORING COMPUESTO EDR - v2.0   "
 echo "================================================"
 echo
 
@@ -11,13 +11,14 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
 NC='\033[0m'
 
 # Directorio de pruebas
-TEST_DIR="/tmp/edr_full_test_$(date +%s)"
+TEST_DIR="/tmp/edr_scoring_test_$(date +%s)"
 mkdir -p "$TEST_DIR"
 
-# Función para obtener conteos sin problemas de newlines
+# Función para obtener conteos
 get_count() {
     local file="$1"
     local pattern="$2"
@@ -25,7 +26,6 @@ get_count() {
     
     if [ -f "$file" ] && [ -s "$file" ]; then
         count=$(grep -c "$pattern" "$file" 2>/dev/null | head -1 | tr -d '\n\r' || echo "0")
-        # Verificar que es un número válido
         if ! [[ "$count" =~ ^[0-9]+$ ]]; then
             count=0
         fi
@@ -33,34 +33,36 @@ get_count() {
     echo "$count"
 }
 
-# Limpiar
+# Limpiar estado previo
 echo "🧹 Limpiando estado previo..."
 pkill -f collector 2>/dev/null
 pkill -f detector 2>/dev/null
-pkill -f nc 2>/dev/null
-pkill -f gdb 2>/dev/null
-rm -f /tmp/edr_full.log /tmp/edr_alerts.log
+rm -f /tmp/edr_scoring.log /tmp/edr_alerts.log /tmp/edr.err
 rm -f edr_events.db
 sleep 2
 
-# Iniciar pipeline completo
-echo "🚀 Iniciando pipeline EDR completo..."
-echo "   Collector → Detector → Alertas"
-echo
+# ==========================================
+# INICIAR SISTEMA CON VERBOSE SCORING
+# ==========================================
+echo "🚀 Iniciando EDR con VERBOSE SCORING..."
+echo "   Modo: Trazabilidad completa del scoring"
 
-# Iniciar collector + detector
+# Activar modo verbose para el scoring
+export EDR_VERBOSE_SCORING=1
+
+# Iniciar pipeline con verbose scoring
 sudo python3 collector.py --verbose --no-hash 2>/tmp/edr.err | \
-    tee /tmp/edr_full.log | \
+    tee /tmp/edr_scoring.log | \
     python3 hash_detection_detector.py > /tmp/edr_alerts.log 2>&1 &
 PIPELINE_PID=$!
 
 echo "   Pipeline iniciado (PID: $PIPELINE_PID)"
-echo "   Esperando inicialización..."
+echo "   Variable EDR_VERBOSE_SCORING=$EDR_VERBOSE_SCORING"
 
-# Esperar que todo esté listo
+# Esperar inicialización
 for i in {1..10}; do
     if grep -q "Monitorizando" /tmp/edr.err 2>/dev/null; then
-        echo -e "${GREEN}✓ Sistema EDR activo${NC}"
+        echo -e "${GREEN}✓ Sistema EDR activo con verbose scoring${NC}"
         break
     fi
     sleep 1
@@ -69,444 +71,287 @@ done
 echo
 sleep 3
 
-# =========================================
-# TEST 1: DETECCIÓN DE BORRADO MASIVO
-# =========================================
+# ==========================================
+# TEST 1: SCORING INDIVIDUAL (NO DEBE ALERTAR)
+# ==========================================
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}TEST 1: DETECCIÓN DE BORRADO MASIVO${NC}"
+echo -e "${BLUE}TEST 1: INDICADORES INDIVIDUALES${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Simulando borrado de múltiples archivos críticos..."
+echo "Generando indicadores individuales que NO deben superar umbral..."
 
-# Crear archivos críticos
-for i in {1..12}; do
-    touch "$TEST_DIR/document_$i.pdf"
-    touch "$TEST_DIR/photo_$i.jpg"
+# Indicador 1: Escritura masiva (+3 puntos, no debe alertar solo)
+echo "Generando escritura masiva (50MB)..."
+dd if=/dev/zero of="$TEST_DIR/big_file.dat" bs=1M count=50 2>/dev/null
+echo "✓ Escritura de 50MB completada (+3 puntos esperados)"
+
+sleep 2
+
+# Indicador 2: Ejecución desde /tmp (+2 puntos, no debe alertar solo)
+echo "Creando script en /tmp..."
+cat > /tmp/test_script.sh << 'EOF'
+#!/bin/bash
+echo "Script ejecutado desde /tmp"
+sleep 1
+EOF
+chmod +x /tmp/test_script.sh
+/tmp/test_script.sh
+echo "✓ Ejecución desde /tmp completada (+2 puntos esperados)"
+
+sleep 2
+
+# Verificar que NO hay alertas RANSOMWARE
+RANSOMWARE_ALERTS=$(get_count "/tmp/edr_alerts.log" "RANSOMWARE")
+if [ "$RANSOMWARE_ALERTS" -eq "0" ]; then
+    echo -e "${GREEN}✅ CORRECTO: Indicadores individuales no generan alertas${NC}"
+    echo "   Scoring compuesto funcionando según diseño"
+else
+    echo -e "${RED}❌ ERROR: Indicadores individuales generaron alertas${NC}"
+fi
+
+# Verificar logs de scoring verbose
+if grep -q "SCORING PID" /tmp/edr_alerts.log 2>/dev/null; then
+    echo -e "${GREEN}✓ Verbose scoring activo${NC}"
+    echo "   Últimos logs de scoring:"
+    grep "SCORING PID" /tmp/edr_alerts.log | tail -3 | sed 's/^/      /'
+else
+    echo -e "${YELLOW}⚠ Verbose scoring no detectado${NC}"
+fi
+
+# ==========================================
+# TEST 2: COMBINACIÓN QUE ALCANZA UMBRAL
+# ==========================================
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BLUE}TEST 2: COMBINACIÓN MULTI-INDICADOR${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Combinando indicadores para superar umbral de 6 puntos..."
+
+COMBO_DIR="$TEST_DIR/combo_attack"
+mkdir -p "$COMBO_DIR"
+
+# Indicador 1: Crear archivos .locked masivamente (+3 puntos)
+echo "Fase 1: Creando archivos .locked (+3 puntos esperados)..."
+for i in {1..6}; do
+    touch "$COMBO_DIR/victim_$i.locked"
 done
-echo "✓ Creados 24 archivos críticos"
+echo "✓ 6 archivos .locked creados"
 
-# Borrar rápidamente (patrón ransomware)
-echo "Borrando archivos rápidamente..."
-for file in "$TEST_DIR"/*.pdf "$TEST_DIR"/*.jpg; do
+sleep 2
+
+# Indicador 2: Borrado masivo (+3 puntos)
+echo "Fase 2: Borrando archivos masivamente (+3 puntos esperados)..."
+for i in {1..6}; do
+    echo "data" > "$COMBO_DIR/delete_me_$i.doc"
+done
+# Borrar rápidamente
+for file in "$COMBO_DIR"/delete_me_*.doc; do
     rm "$file" 2>/dev/null
 done
-echo "✓ Archivos borrados"
+echo "✓ Borrado masivo completado"
 
-sleep 3
+sleep 2
 
-# Verificar detección
-echo "Verificando alertas generadas..."
-if grep -q "BORRADO MASIVO\|PATRÓN RANSOMWARE" /tmp/edr_alerts.log 2>/dev/null; then
-    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Borrado masivo detectado${NC}"
-    grep "BORRADO MASIVO\|PATRÓN RANSOMWARE" /tmp/edr_alerts.log | head -2
-else
-    echo -e "${YELLOW}⚠ No se detectó borrado masivo (revisar umbrales)${NC}"
-fi
-
-# =========================================
-# TEST 2: DETECCIÓN DE ESCALACIÓN DE PRIVILEGIOS
-# =========================================
-echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}TEST 2: ESCALACIÓN DE PRIVILEGIOS${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Creando binario y aplicando SETUID..."
-
-# Crear script ejecutable
-cat > "$TEST_DIR/backdoor.sh" << 'EOF'
-#!/bin/bash
-echo "Backdoor simulada"
-EOF
-chmod +x "$TEST_DIR/backdoor.sh"
-echo "✓ Script creado"
-
-# Aplicar SETUID (privilege escalation)
-chmod u+s "$TEST_DIR/backdoor.sh"
+# Indicador 3: CHMOD sospechoso (+2 puntos)
+echo "Fase 3: Cambio de permisos SETUID (+2 puntos esperados)..."
+touch "$COMBO_DIR/backdoor"
+chmod u+s "$COMBO_DIR/backdoor" 2>/dev/null
 echo "✓ SETUID aplicado"
 
-# Múltiples cambios sospechosos
-chmod 777 "$TEST_DIR/backdoor.sh"
-chmod g+s "$TEST_DIR/backdoor.sh"
-echo "✓ Permisos sospechosos aplicados"
-
 sleep 3
 
-# Verificar detección
-echo "Verificando alertas de privilegios..."
-if grep -q "ESCALACIÓN PRIVILEGIOS\|SETUID\|ALERTA CRÍTICA" /tmp/edr_alerts.log 2>/dev/null; then
-    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Escalación de privilegios detectada${NC}"
-    grep "ESCALACIÓN\|SETUID\|ALERTA CRÍTICA" /tmp/edr_alerts.log | head -2
+# Verificar que SÍ hay alertas RANSOMWARE
+echo "Verificando detección combinada..."
+COMBO_ALERTS=$(get_count "/tmp/edr_alerts.log" "RANSOMWARE.*SCORE")
+if [ "$COMBO_ALERTS" -gt "0" ]; then
+    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Combinación detectada${NC}"
+    echo "   Alertas de scoring encontradas:"
+    grep "RANSOMWARE.*SCORE" /tmp/edr_alerts.log | tail -2 | sed 's/^/      /'
 else
-    echo -e "${YELLOW}⚠ No se detectó escalación de privilegios${NC}"
+    echo -e "${RED}❌ ERROR: Combinación no detectada${NC}"
+    echo "   Revisando logs de scoring..."
+    grep "SCORING PID" /tmp/edr_alerts.log | tail -5 | sed 's/^/      /'
 fi
 
-# =========================================
-# TEST 3: DETECCIÓN DE CONEXIONES DE RED
-# =========================================
+# ==========================================
+# TEST 3: PATRÓN RANSOMWARE REAL
+# ==========================================
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}TEST 3: DETECCIÓN DE CONEXIONES DE RED${NC}"
+echo -e "${BLUE}TEST 3: SIMULACIÓN RANSOMWARE REAL${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Simulando conexiones de red sospechosas..."
+echo "Simulando ataque ransomware completo..."
 
-# Test CONNECT - netcat listener y cliente
-echo "Iniciando servidor netcat..."
-nc -l 8888 > /dev/null 2>&1 &
-NC_PID=$!
-sleep 1
-
-echo "Conectando como cliente..."
-echo "test connection" | timeout 3 nc localhost 8888 &
-sleep 2
-
-# Cleanup netcat
-kill $NC_PID 2>/dev/null
-echo "✓ Conexiones de red simuladas"
-
-sleep 3
-
-# Verificar detección
-echo "Verificando alertas de red..."
-if grep -q "CONEXIÓN SOSPECHOSA\|NETWORK" /tmp/edr_alerts.log 2>/dev/null; then
-    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Conexiones sospechosas detectadas${NC}"
-    grep "CONEXIÓN\|NETWORK" /tmp/edr_alerts.log | head -2
-else
-    echo -e "${YELLOW}⚠ No se detectaron conexiones sospechosas${NC}"
-fi
-
-# =========================================
-# TEST 4: DETECCIÓN DE INYECCIÓN DE PROCESOS
-# =========================================
-echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}TEST 4: DETECCIÓN DE INYECCIÓN DE PROCESOS${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Simulando inyección via ptrace..."
-
-# Test PTRACE - usar gdb para hacer ptrace
-echo "Creando proceso objetivo..."
-sleep 300 &
-TARGET_PID=$!
-
-echo "Ejecutando ptrace con gdb..."
-timeout 5 gdb -p $TARGET_PID -batch -ex "info registers" -ex "detach" > /dev/null 2>&1 &
-sleep 3
-
-# Cleanup
-kill $TARGET_PID 2>/dev/null
-echo "✓ Operaciones ptrace simuladas"
-
-sleep 3
-
-# Verificar detección
-echo "Verificando alertas de inyección..."
-if grep -q "INYECCIÓN PROCESO\|PTRACE" /tmp/edr_alerts.log 2>/dev/null; then
-    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Inyección de procesos detectada${NC}"
-    grep "INYECCIÓN\|PTRACE" /tmp/edr_alerts.log | head -2
-else
-    echo -e "${YELLOW}⚠ No se detectó inyección de procesos${NC}"
-fi
-
-# =========================================
-# TEST 5: DETECCIÓN DE EJECUCIÓN EN MEMORIA
-# =========================================
-echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}TEST 5: DETECCIÓN DE EJECUCIÓN EN MEMORIA${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Simulando mapeo de memoria ejecutable..."
-
-# Test MMAP - crear script que use mmap con WRITE+EXEC
-cat > "$TEST_DIR/mmap_test.py" << 'EOF'
-import mmap
-import os
-# Crear archivo temporal y mapearlo con permisos WRITE+EXEC
-with open('/tmp/test_mmap', 'w+b') as f:
-    f.write(b'test' * 1024)
-    f.flush()
-    # Mapear con WRITE+EXEC (sospechoso)
-    mm = mmap.mmap(f.fileno(), 4096, prot=mmap.PROT_WRITE|mmap.PROT_EXEC)
-    mm.close()
-os.remove('/tmp/test_mmap')
-EOF
-
-python3 "$TEST_DIR/mmap_test.py" 2>/dev/null &
-sleep 2
-echo "✓ Mapeo de memoria ejecutable simulado"
-
-sleep 3
-
-# Verificar detección
-echo "Verificando alertas de memoria..."
-if grep -q "EJECUCIÓN MEMORIA\|MMAP" /tmp/edr_alerts.log 2>/dev/null; then
-    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Ejecución en memoria detectada${NC}"
-    grep "EJECUCIÓN\|MMAP" /tmp/edr_alerts.log | head -2
-else
-    echo -e "${YELLOW}⚠ No se detectó ejecución en memoria${NC}"
-fi
-
-# =========================================
-# TEST 6: DETECCIÓN DE CAMBIO DE PROPIETARIO
-# =========================================
-echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}TEST 6: DETECCIÓN DE CAMBIO DE PROPIETARIO${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Simulando cambios de propietario sospechosos..."
-
-# Crear archivo como usuario normal y intentar cambiarlo a root
-touch "$TEST_DIR/testfile"
-echo "✓ Archivo creado"
-
-# Simular chown (esto normalmente fallaría, pero genera el evento)
-chown root "$TEST_DIR/testfile" 2>/dev/null || echo "   (Cambio de owner esperado que falle)"
-chown 1000 "$TEST_DIR/testfile" 2>/dev/null
-echo "✓ Cambios de propietario simulados"
-
-sleep 3
-
-# Verificar detección
-echo "Verificando alertas de ownership..."
-if grep -q "CAMBIO PROPIETARIO\|CHOWN" /tmp/edr_alerts.log 2>/dev/null; then
-    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Cambios de propietario detectados${NC}"
-    grep "PROPIETARIO\|CHOWN" /tmp/edr_alerts.log | head -2
-else
-    echo -e "${YELLOW}⚠ No se detectaron cambios de propietario${NC}"
-fi
-
-# =========================================
-# TEST 7: PATRÓN RANSOMWARE COMPLETO
-# =========================================
-echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}TEST 7: PATRÓN RANSOMWARE COMPLETO${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Simulando: crear → cifrar → borrar → cambiar permisos"
-
-RANSOM_DIR="$TEST_DIR/ransomware"
+RANSOM_DIR="$TEST_DIR/realistic_ransomware"
 mkdir -p "$RANSOM_DIR"
 
-# Fase 1: Crear archivos víctima
-echo "Fase 1: Creando archivos víctima..."
+# Paso 1: Escritura masiva (cifrado simulado) +3
+echo "Simulando cifrado masivo..."
+dd if=/dev/urandom of="$RANSOM_DIR/encryption_data" bs=1M count=25 2>/dev/null
+
+# Paso 2: Crear archivos cifrados +3
+echo "Creando archivos .encrypted..."
+for i in {1..7}; do
+    echo "encrypted_data_$i" > "$RANSOM_DIR/document_$i.encrypted"
+done
+
+# Paso 3: Borrar originales +3
+echo "Borrando archivos originales..."
 for i in {1..8}; do
-    echo "Important data $i" > "$RANSOM_DIR/file_$i.doc"
+    echo "original_data_$i" > "$RANSOM_DIR/original_$i.doc"
+done
+sleep 1
+for file in "$RANSOM_DIR"/original_*.doc; do
+    rm "$file" 2>/dev/null
 done
 
-# Fase 2: Simular cifrado (crear .locked, borrar originales)
-echo "Fase 2: Cifrando y borrando originales..."
-for file in "$RANSOM_DIR"/*.doc; do
-    base=$(basename "$file" .doc)
-    # Crear versión "cifrada"
-    dd if=/dev/urandom of="$RANSOM_DIR/$base.locked" bs=2K count=1 2>/dev/null
-    # Cambiar permisos para evitar modificación
-    chmod 400 "$RANSOM_DIR/$base.locked"
-    # Borrar original
-    rm "$file"
-done
+# Paso 4: Ejecución desde /tmp +2
+echo "Ejecutando desde /tmp..."
+cat > /tmp/ransom_script.sh << 'EOF'
+#!/bin/bash
+echo "Ransomware simulation"
+sleep 1
+EOF
+chmod +x /tmp/ransom_script.sh
+/tmp/ransom_script.sh
 
-echo "✓ Patrón ransomware ejecutado"
 sleep 3
 
-# Verificar detección
-echo "Verificando detección de ransomware..."
-RANSOMWARE_ALERTS=$(get_count "/tmp/edr_alerts.log" "RANSOMWARE")
-if [ "$RANSOMWARE_ALERTS" -gt "0" ]; then
-    echo -e "${GREEN}✅ DETECCIÓN EXITOSA: Ransomware detectado ($RANSOMWARE_ALERTS alertas)${NC}"
-    grep "RANSOMWARE" /tmp/edr_alerts.log | head -2
+# Verificar detección de patrón real
+echo "Verificando detección de ransomware real..."
+REAL_ALERTS=$(get_count "/tmp/edr_alerts.log" "RANSOMWARE")
+if [ "$REAL_ALERTS" -gt "0" ]; then
+    echo -e "${GREEN}✅ RANSOMWARE REAL DETECTADO${NC}"
+    echo "   Total alertas: $REAL_ALERTS"
+    
+    # Mostrar desglose del scoring
+    echo "   Desglose de scoring detectado:"
+    grep "RANSOMWARE.*SCORE" /tmp/edr_alerts.log | tail -1 | sed 's/^/      /'
 else
-    echo -e "${YELLOW}⚠ No se detectó patrón ransomware${NC}"
+    echo -e "${RED}❌ RANSOMWARE REAL NO DETECTADO${NC}"
 fi
 
-# =========================================
-# ANÁLISIS DE RESULTADOS
-# =========================================
+# ==========================================
+# TEST 4: ANÁLISIS DE LOGS VERBOSE
+# ==========================================
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}ANÁLISIS DE RESULTADOS - TODAS LAS SYSCALLS${NC}"
+echo -e "${BLUE}TEST 4: ANÁLISIS DE SCORING VERBOSE${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Contar eventos capturados para TODAS las syscalls
-TOTAL_EVENTS=0
-if [ -f "/tmp/edr_full.log" ]; then
-    TOTAL_EVENTS=$(wc -l < /tmp/edr_full.log 2>/dev/null | tr -d '\n\r' || echo "0")
-    if ! [[ "$TOTAL_EVENTS" =~ ^[0-9]+$ ]]; then
-        TOTAL_EVENTS=0
-    fi
+# Contar progresión de scoring
+SCORING_LINES=$(get_count "/tmp/edr_alerts.log" "SCORING PID")
+if [ "$SCORING_LINES" -gt "0" ]; then
+    echo "📊 Análisis de progresión de scoring:"
+    echo "   Total logs de scoring: $SCORING_LINES"
+    
+    # Mostrar ejemplos de progresión
+    echo "   Ejemplos de progresión de puntos:"
+    grep "SCORING PID" /tmp/edr_alerts.log | grep -v "0/6" | tail -5 | sed 's/^/      /'
+    
+    # Verificar diferentes tipos de indicadores
+    echo "   Tipos de indicadores detectados:"
+    grep "SCORING PID" /tmp/edr_alerts.log | grep -o '\[[^]]*\]' | sort | uniq -c | sed 's/^/      /'
+else
+    echo -e "${YELLOW}⚠ No se encontraron logs de scoring verbose${NC}"
 fi
 
-# Contar cada tipo de syscall
-EXEC_COUNT=$(get_count "/tmp/edr_full.log" '"type":"EXEC"')
-OPEN_COUNT=$(get_count "/tmp/edr_full.log" '"type":"OPEN"')
-WRITE_COUNT=$(get_count "/tmp/edr_full.log" '"type":"WRITE"')
-UNLINK_COUNT=$(get_count "/tmp/edr_full.log" '"type":"UNLINK"')
-CHMOD_COUNT=$(get_count "/tmp/edr_full.log" '"type":"CHMOD"')
-CONNECT_COUNT=$(get_count "/tmp/edr_full.log" '"type":"CONNECT"')
-PTRACE_COUNT=$(get_count "/tmp/edr_full.log" '"type":"PTRACE"')
-MMAP_COUNT=$(get_count "/tmp/edr_full.log" '"type":"MMAP"')
-CHOWN_COUNT=$(get_count "/tmp/edr_full.log" '"type":"CHOWN"')
-
-echo "📊 Eventos capturados por syscall (9 tipos):"
-echo "   Total eventos: $TOTAL_EVENTS"
-echo "   ├─ EXEC: $EXEC_COUNT"
-echo "   ├─ OPEN: $OPEN_COUNT"
-echo "   ├─ WRITE: $WRITE_COUNT"
-echo "   ├─ UNLINK: $UNLINK_COUNT"
-echo "   ├─ CHMOD: $CHMOD_COUNT"
-echo "   ├─ CONNECT: $CONNECT_COUNT"
-echo "   ├─ PTRACE: $PTRACE_COUNT"
-echo "   ├─ MMAP: $MMAP_COUNT"
-echo "   └─ CHOWN: $CHOWN_COUNT"
-
-# Contar alertas generadas
+# ==========================================
+# ANÁLISIS FINAL DEL SISTEMA
+# ==========================================
 echo
-echo "🚨 Alertas generadas:"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${PURPLE}ANÁLISIS FINAL - SISTEMA DE SCORING${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Contar eventos y alertas
+TOTAL_EVENTS=$(get_count "/tmp/edr_scoring.log" '"type"')
 TOTAL_ALERTS=$(get_count "/tmp/edr_alerts.log" "ALERTA:")
-echo "   Total alertas: $TOTAL_ALERTS"
+SCORING_ALERTS=$(get_count "/tmp/edr_alerts.log" "RANSOMWARE.*SCORE")
+INDIVIDUAL_ALERTS=$(get_count "/tmp/edr_alerts.log" "ALERTA:" | awk -v sa="$SCORING_ALERTS" '{print $1-sa}')
 
-if [ -f /tmp/edr_alerts.log ] && [ -s /tmp/edr_alerts.log ]; then
-    echo "   Tipos de alertas:"
-    grep "ALERTA:" /tmp/edr_alerts.log 2>/dev/null | cut -d: -f2 | cut -d' ' -f2-4 | sort | uniq -c | head -8
+echo "📈 Métricas del sistema:"
+echo "   Total eventos procesados: $TOTAL_EVENTS"
+echo "   Total alertas generadas: $TOTAL_ALERTS"
+echo "   Alertas por scoring compuesto: $SCORING_ALERTS"
+echo "   Alertas individuales: $INDIVIDUAL_ALERTS"
+
+# Calcular eficacia del scoring
+if [ "$SCORING_ALERTS" -gt "0" ]; then
+    echo -e "   ${GREEN}✓ Sistema de scoring compuesto: FUNCIONAL${NC}"
+else
+    echo -e "   ${RED}✗ Sistema de scoring compuesto: NO FUNCIONAL${NC}"
 fi
 
-# Verificar base de datos
+# Verificar configuración
 echo
-echo "💾 Base de datos:"
-DB_EVENTS=""
-DB_ALERTS=""
-if [ -f "edr_events.db" ]; then
-    DB_EVENTS=$(sqlite3 edr_events.db "SELECT COUNT(*) FROM events;" 2>/dev/null | tr -d '\n\r' || echo "0")
-    DB_ALERTS=$(sqlite3 edr_events.db "SELECT COUNT(*) FROM events WHERE alert_level IS NOT NULL;" 2>/dev/null | tr -d '\n\r' || echo "0")
-    
-    # Verificar que son números válidos
-    if ! [[ "$DB_EVENTS" =~ ^[0-9]+$ ]]; then
-        DB_EVENTS="0"
-    fi
-    if ! [[ "$DB_ALERTS" =~ ^[0-9]+$ ]]; then
-        DB_ALERTS="0"
-    fi
-    
-    echo "   Eventos guardados: $DB_EVENTS"
-    echo "   Eventos con alerta: $DB_ALERTS"
-    
-    # Mostrar distribución por tipo en BD
-    if [ "$DB_EVENTS" -gt "0" ]; then
-        echo "   Distribución en BD:"
-        sqlite3 edr_events.db "SELECT event_type, COUNT(*) FROM events GROUP BY event_type ORDER BY COUNT(*) DESC;" 2>/dev/null | head -9 | while read line; do
-            echo "      $line"
-        done
-    fi
-else
-    echo "   Base de datos no encontrada"
-    DB_EVENTS="0"
-    DB_ALERTS="0"
+echo "⚙️ Configuración del scoring:"
+if grep -q "Umbral configurado: >6 puntos" /tmp/edr_alerts.log 2>/dev/null; then
+    grep "Umbral configurado\|Ventana temporal\|PIDs que alcanzaron" /tmp/edr_alerts.log | sed 's/^/   /'
 fi
 
-# =========================================
-# VALIDACIÓN FINAL
-# =========================================
+# ==========================================
+# VALIDACIÓN ACADÉMICA
+# ==========================================
 echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${BLUE}VALIDACIÓN DEL SISTEMA COMPLETO${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🎓 Validación académica (ESCAPADE/LeARN):"
 
-TESTS_PASSED=0
-TESTS_TOTAL=8
+VALIDATION_SCORE=0
+VALIDATION_TOTAL=5
 
-# Test 1: Captura de syscalls básicas
-if [ "$UNLINK_COUNT" -gt "10" ] && [ "$CHMOD_COUNT" -gt "3" ]; then
-    echo -e "   ${GREEN}✓ Syscalls básicas funcionando (UNLINK/CHMOD)${NC}"
-    ((TESTS_PASSED++))
+# Test 1: Scoring compuesto funcionando
+if [ "$SCORING_ALERTS" -gt "0" ]; then
+    echo -e "   ${GREEN}✓ Detección compuesta funcional${NC}"
+    ((VALIDATION_SCORE++))
 else
-    echo -e "   ${RED}✗ Captura insuficiente syscalls básicas (UNLINK: $UNLINK_COUNT, CHMOD: $CHMOD_COUNT)${NC}"
+    echo -e "   ${RED}✗ Detección compuesta no funcional${NC}"
 fi
 
-# Test 2: Captura de nuevas syscalls
-NUEVA_SYSCALLS_OK=0
-if [ "$CONNECT_COUNT" -gt "0" ]; then ((NUEVA_SYSCALLS_OK++)); fi
-if [ "$PTRACE_COUNT" -gt "0" ]; then ((NUEVA_SYSCALLS_OK++)); fi
-if [ "$MMAP_COUNT" -gt "0" ]; then ((NUEVA_SYSCALLS_OK++)); fi
-
-if [ "$NUEVA_SYSCALLS_OK" -ge "2" ]; then
-    echo -e "   ${GREEN}✓ Nuevas syscalls funcionando ($NUEVA_SYSCALLS_OK/3 activas)${NC}"
-    ((TESTS_PASSED++))
+# Test 2: Verbose logging activo
+if [ "$SCORING_LINES" -gt "10" ]; then
+    echo -e "   ${GREEN}✓ Trazabilidad de scoring activa${NC}"
+    ((VALIDATION_SCORE++))
 else
-    echo -e "   ${YELLOW}⚠ Pocas nuevas syscalls activas ($NUEVA_SYSCALLS_OK/3) (CONNECT: $CONNECT_COUNT, PTRACE: $PTRACE_COUNT, MMAP: $MMAP_COUNT)${NC}"
+    echo -e "   ${RED}✗ Trazabilidad insuficiente${NC}"
 fi
 
-# Test 3: Diversidad de eventos
-TIPOS_ACTIVOS=0
-for count in "$EXEC_COUNT" "$OPEN_COUNT" "$WRITE_COUNT" "$UNLINK_COUNT" "$CHMOD_COUNT" "$CONNECT_COUNT" "$PTRACE_COUNT" "$MMAP_COUNT" "$CHOWN_COUNT"; do
-    if [ "$count" -gt "0" ]; then ((TIPOS_ACTIVOS++)); fi
-done
-
-if [ "$TIPOS_ACTIVOS" -ge "6" ]; then
-    echo -e "   ${GREEN}✓ Diversidad de syscalls ($TIPOS_ACTIVOS/9 tipos activos)${NC}"
-    ((TESTS_PASSED++))
+# Test 3: Indicadores individuales no alertan
+if [ "$SCORING_ALERTS" -gt "$INDIVIDUAL_ALERTS" ]; then
+    echo -e "   ${GREEN}✓ Reducción de falsos positivos${NC}"
+    ((VALIDATION_SCORE++))
 else
-    echo -e "   ${YELLOW}⚠ Poca diversidad de eventos ($TIPOS_ACTIVOS/9 tipos)${NC}"
+    echo -e "   ${YELLOW}⚠ Revisar balance individual vs compuesto${NC}"
 fi
 
-# Test 4: Generación de alertas
-if [ "$TOTAL_ALERTS" -gt "5" ]; then
-    echo -e "   ${GREEN}✓ Sistema de alertas muy activo ($TOTAL_ALERTS alertas)${NC}"
-    ((TESTS_PASSED++))
-elif [ "$TOTAL_ALERTS" -gt "0" ]; then
-    echo -e "   ${YELLOW}⚠ Pocas alertas generadas ($TOTAL_ALERTS)${NC}"
+# Test 4: Múltiples tipos de indicadores
+INDICATOR_TYPES=$(grep "SCORING PID" /tmp/edr_alerts.log | grep -o '\[[^]]*\]' | sort | uniq | wc -l)
+if [ "$INDICATOR_TYPES" -ge "3" ]; then
+    echo -e "   ${GREEN}✓ Diversidad de indicadores ($INDICATOR_TYPES tipos)${NC}"
+    ((VALIDATION_SCORE++))
 else
-    echo -e "   ${RED}✗ No se generaron alertas${NC}"
+    echo -e "   ${YELLOW}⚠ Poca diversidad de indicadores ($INDICATOR_TYPES tipos)${NC}"
 fi
 
-# Test 5: Persistencia en BD
-if [ "$DB_EVENTS" -gt "0" ]; then
-    echo -e "   ${GREEN}✓ Persistencia en BD funcionando ($DB_EVENTS eventos)${NC}"
-    ((TESTS_PASSED++))
+# Test 5: Ransomware real detectado
+if [ "$REAL_ALERTS" -gt "0" ]; then
+    echo -e "   ${GREEN}✓ Detección de patrones realistas${NC}"
+    ((VALIDATION_SCORE++))
 else
-    echo -e "   ${RED}✗ BD no está guardando eventos${NC}"
+    echo -e "   ${RED}✗ Patrones realistas no detectados${NC}"
 fi
 
-# Test 6: Detección de amenazas específicas
-THREAT_TYPES=0
-if grep -q "RANSOMWARE\|BORRADO MASIVO" /tmp/edr_alerts.log 2>/dev/null; then ((THREAT_TYPES++)); fi
-if grep -q "ESCALACIÓN\|SETUID" /tmp/edr_alerts.log 2>/dev/null; then ((THREAT_TYPES++)); fi
-if grep -q "CONEXIÓN\|INYECCIÓN\|EJECUCIÓN MEMORIA" /tmp/edr_alerts.log 2>/dev/null; then ((THREAT_TYPES++)); fi
-
-if [ "$THREAT_TYPES" -ge "2" ]; then
-    echo -e "   ${GREEN}✓ Detección multi-amenaza activa ($THREAT_TYPES tipos)${NC}"
-    ((TESTS_PASSED++))
-else
-    echo -e "   ${YELLOW}⚠ Detección limitada de amenazas ($THREAT_TYPES tipos)${NC}"
-fi
-
-# Test 7: Volumen de datos
-if [ "$TOTAL_EVENTS" -gt "100" ]; then
-    echo -e "   ${GREEN}✓ Volumen alto de eventos ($TOTAL_EVENTS)${NC}"
-    ((TESTS_PASSED++))
-else
-    echo -e "   ${YELLOW}⚠ Bajo volumen de eventos ($TOTAL_EVENTS)${NC}"
-fi
-
-# Test 8: Sistema estable
-if kill -0 $PIPELINE_PID 2>/dev/null; then
-    echo -e "   ${GREEN}✓ Sistema estable y ejecutándose${NC}"
-    ((TESTS_PASSED++))
-else
-    echo -e "   ${RED}✗ Sistema crasheó${NC}"
-fi
-
-# Resultado final
+# Resultado final de validación
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-if [ "$TESTS_PASSED" -eq "$TESTS_TOTAL" ]; then
-    echo -e "${GREEN}🚀 SISTEMA EDR COMPLETAMENTE FUNCIONAL ($TESTS_PASSED/$TESTS_TOTAL)${NC}"
-    echo "Todas las syscalls están integradas y funcionando perfectamente"
-elif [ "$TESTS_PASSED" -ge 6 ]; then
-    echo -e "${GREEN}✅ SISTEMA EDR ALTAMENTE FUNCIONAL ($TESTS_PASSED/$TESTS_TOTAL)${NC}"
-    echo "La mayoría de funcionalidades están operativas"
-elif [ "$TESTS_PASSED" -ge 4 ]; then
-    echo -e "${YELLOW}⚠️ SISTEMA PARCIALMENTE FUNCIONAL ($TESTS_PASSED/$TESTS_TOTAL)${NC}"
-    echo "Revisar configuración y umbrales de detección"
+if [ "$VALIDATION_SCORE" -eq "$VALIDATION_TOTAL" ]; then
+    echo -e "${GREEN}🏆 SISTEMA ACADÉMICAMENTE VALIDADO ($VALIDATION_SCORE/$VALIDATION_TOTAL)${NC}"
+    echo "   Implementación de ESCAPADE/LeARN correcta"
+elif [ "$VALIDATION_SCORE" -ge 3 ]; then
+    echo -e "${GREEN}✅ SISTEMA MAYORMENTE VALIDADO ($VALIDATION_SCORE/$VALIDATION_TOTAL)${NC}"
+    echo "   Scoring compuesto funcionando adecuadamente"
 else
-    echo -e "${RED}❌ SISTEMA REQUIERE REVISIÓN MAYOR ($TESTS_PASSED/$TESTS_TOTAL)${NC}"
+    echo -e "${RED}❌ SISTEMA REQUIERE REVISIÓN ($VALIDATION_SCORE/$VALIDATION_TOTAL)${NC}"
+    echo "   Implementación de scoring necesita ajustes"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -514,24 +359,20 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo
 echo "🧹 Limpiando..."
 kill $PIPELINE_PID 2>/dev/null
-pkill -f nc 2>/dev/null
-pkill -f gdb 2>/dev/null
-pkill -f sleep 2>/dev/null
 rm -rf "$TEST_DIR"
+unset EDR_VERBOSE_SCORING
 
 echo
-echo "📝 Logs y datos guardados en:"
-echo "   - /tmp/edr_full.log (eventos JSON de todas las syscalls)"
-echo "   - /tmp/edr_alerts.log (alertas del detector)"
-echo "   - /tmp/edr.err (errores/debug del collector)"
-echo "   - edr_events.db (base de datos completa)"
+echo "📋 Archivos de análisis:"
+echo "   - /tmp/edr_scoring.log (eventos JSON)"
+echo "   - /tmp/edr_alerts.log (alertas y scoring verbose)"
+echo "   - /tmp/edr.err (debug del collector)"
+echo "   - edr_events.db (base de datos)"
 
 echo
-echo "📊 RESUMEN FINAL:"
-echo "   • $TIPOS_ACTIVOS/9 tipos de syscalls capturadas"
-echo "   • $TOTAL_EVENTS eventos totales procesados"
-echo "   • $TOTAL_ALERTS alertas de seguridad generadas"
-echo "   • $DB_EVENTS eventos persistidos en base de datos"
+echo "🎯 Para análisis detallado:"
+echo "   grep 'SCORING PID' /tmp/edr_alerts.log"
+echo "   grep 'RANSOMWARE.*SCORE' /tmp/edr_alerts.log"
 
 echo
-echo "✨ Test completo de todas las syscalls terminado"
+echo "✨ Test de sistema de scoring completado"

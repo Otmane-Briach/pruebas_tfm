@@ -63,9 +63,9 @@ else
 fi
 
 # Iniciar pipeline con verbose scoring
-sudo python3 collector.py --verbose --no-hash 2>/tmp/edr.err | \
+sudo python3 -u collector.py --verbose --no-hash 2>/tmp/edr.err | \
     tee /tmp/edr_scoring.log | \
-    python3 hash_detection_detector.py > /tmp/edr_alerts.log 2>&1 &
+    python3 -u hash_detection_detector.py > /tmp/edr_alerts.log 2>&1 &
 PIPELINE_PID=$!
 
 echo "   Pipeline iniciado (PID: $PIPELINE_PID)"
@@ -197,6 +197,46 @@ echo "Simulando ataque ransomware completo..."
 RANSOM_DIR="$TEST_DIR/realistic_ransomware"
 mkdir -p "$RANSOM_DIR"
 
+# Crear proceso malicioso simulado para Response Engine
+if [ "$EDR_RESPONSE_MODE" != "monitor" ]; then
+    echo "Creando proceso malicioso simulado para Response Engine..."
+    cat > "$RANSOM_DIR/fake_ransomware.sh" << 'EOF'
+#!/bin/bash
+# Proceso simulado de ransomware
+echo "Fake ransomware started with PID $$" >&2
+for i in {1..100}; do
+    # Crear archivos .locked (debería triggear emergency stop)
+    for j in {1..6}; do
+        touch "/tmp/ransom_$i_$j.locked" 2>/dev/null
+    done
+    sleep 0.5
+    # Borrar archivos
+    rm -f /tmp/ransom_$i_*.locked 2>/dev/null
+done
+EOF
+    chmod +x "$RANSOM_DIR/fake_ransomware.sh"
+    # Ejecutar en background
+    "$RANSOM_DIR/fake_ransomware.sh" &
+    MALWARE_PID=$!
+    echo "   Proceso malicioso simulado: PID $MALWARE_PID"
+    sleep 2
+    
+    # Verificar si fue detenido
+    if [ "$EDR_RESPONSE_MODE" = "block" ]; then
+        if kill -0 $MALWARE_PID 2>/dev/null; then
+            # Verificar si está en estado T (stopped)
+            STATE=$(ps -o stat= -p $MALWARE_PID 2>/dev/null | head -c 1)
+            if [ "$STATE" = "T" ]; then
+                echo -e "${GREEN}✅ Proceso bloqueado correctamente (estado: STOPPED)${NC}"
+            fi
+        fi
+    elif [ "$EDR_RESPONSE_MODE" = "kill" ]; then
+        if ! kill -0 $MALWARE_PID 2>/dev/null; then
+            echo -e "${GREEN}✅ Proceso terminado correctamente${NC}"
+        fi
+    fi
+fi
+
 # Paso 1: Escritura masiva (cifrado simulado) +3
 echo "Simulando cifrado masivo..."
 dd if=/dev/urandom of="$RANSOM_DIR/encryption_data" bs=1M count=25 2>/dev/null
@@ -307,17 +347,82 @@ else
     echo -e "${GREEN}✓ Response Engine en modo $RESPONSE_MODE${NC}"
     
     # Contar respuestas en logs
-    BLOCKS=$(grep -c "RESPONSE BLOCK" /tmp/edr_alerts.log 2>/dev/null || echo "0")
-    KILLS=$(grep -c "RESPONSE KILL" /tmp/edr_alerts.log 2>/dev/null || echo "0")
+    BLOCKS=$(grep -c "RESPONSE BLOCK" /tmp/edr_alerts.log 2>/dev/null | head -1 || echo "0")
+    KILLS=$(grep -c "RESPONSE KILL" /tmp/edr_alerts.log 2>/dev/null | head -1 || echo "0")
     
     echo "   Acciones ejecutadas:"
     echo "     Procesos bloqueados: $BLOCKS"
     echo "     Procesos terminados: $KILLS"
     
-    if [ "$BLOCKS" -gt "0" ] || [ "$KILLS" -gt "0" ]; then
+    if [ "$BLOCKS" -gt 0 ] || [ "$KILLS" -gt 0 ]; then
         echo -e "${GREEN}✅ RESPONSE ENGINE ACTIVO Y FUNCIONANDO${NC}"
     fi
 fi
+
+# Verificar emergency stops
+EMERGENCY_STOPS=$(grep -c "EMERGENCY STOP" /tmp/edr_alerts.log 2>/dev/null || echo "0")
+if [ "$EMERGENCY_STOPS" -gt "0" ]; then
+    echo -e "${GREEN}✅ Response inmediato detectado: $EMERGENCY_STOPS emergency stops${NC}"
+fi
+
+
+# ==========================================
+# TEST 3.7: PROCESS TREE Y NETWORK ATTRIBUTION
+# ==========================================
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BLUE}TEST 3.7: PROCESS TREE Y NETWORK ATTRIBUTION${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Generando proceso con conexiones de red..."
+
+# Crear proceso malicioso con conexiones
+cat > /tmp/network_malware.py << 'EOF'
+#!/usr/bin/env python3
+import socket
+import os
+import time
+
+# Hacer conexión (se registrará)
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    s.connect(("google.com", 80))
+    s.close()
+except:
+    pass
+
+# Crear archivos para scoring
+for i in range(7):
+    open(f"/tmp/evil_{i}.locked", "w").close()
+
+# Otra conexión
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    s.connect(("8.8.8.8", 53))
+    s.close()
+except:
+    pass
+EOF
+chmod +x /tmp/network_malware.py
+python3 /tmp/network_malware.py
+sleep 3
+
+# Verificar conexiones capturadas
+CONNECT_EVENTS=$(grep -c '"type":"CONNECT"' /tmp/edr_scoring.log 2>/dev/null || echo "0")
+if [ "$CONNECT_EVENTS" -gt "0" ]; then
+    echo -e "${GREEN}✅ Conexiones de red detectadas: $CONNECT_EVENTS${NC}"
+    # Mostrar IPs capturadas
+    echo "   IPs detectadas:"
+    grep '"dest_ip"' /tmp/edr_scoring.log | tail -3 | sed 's/^/      /'
+else
+    echo -e "${YELLOW}⚠ No se capturaron conexiones de red${NC}"
+fi
+
+# Limpiar
+rm -f /tmp/network_test_*.locked 2>/dev/null
+kill $NET_PID 2>/dev/null
+
 
 # ==========================================
 # TEST 4: ANÁLISIS DE LOGS VERBOSE
@@ -376,6 +481,25 @@ echo
 echo "⚙️ Configuración del scoring:"
 if grep -q "Umbral configurado: >6 puntos" /tmp/edr_alerts.log 2>/dev/null; then
     grep "Umbral configurado\|Ventana temporal\|PIDs que alcanzaron" /tmp/edr_alerts.log | sed 's/^/   /'
+fi
+
+# Mostrar Process Tree si existe
+echo
+echo "🌳 Process Tree (procesos sospechosos):"
+if tail -100 /tmp/edr_alerts.log | grep -q "PROCESS TREE:"; then
+    tail -100 /tmp/edr_alerts.log | grep -A 20 "PROCESS TREE:" | head -15 | sed 's/^/   /'
+else
+    echo "   No hay procesos sospechosos con conexiones"
+fi
+
+# Mostrar estadísticas de red
+echo
+echo "🌐 Network Attribution:"
+TOTAL_CONNECTS=$(grep -c '"type":"CONNECT"' /tmp/edr_scoring.log 2>/dev/null || echo "0")
+echo "   Total conexiones capturadas: $TOTAL_CONNECTS"
+if [ "$TOTAL_CONNECTS" -gt "0" ]; then
+    echo "   Últimas IPs detectadas:"
+    grep '"dest_ip"' /tmp/edr_scoring.log | tail -5 | jq -r '"\(.dest_ip):\(.dest_port // "N/A")"' 2>/dev/null | sed 's/^/      /' || echo "      Error parseando IPs"
 fi
 
 # ==========================================
@@ -448,7 +572,16 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 
 
-
+# Forzar que el detector imprima estadísticas finales
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Finalizando detector para ver Process Tree completo..."
+# Enviar SIGTERM al detector para que imprima stats finales
+pkill -TERM -f hash_detection_detector 2>/dev/null
+sleep 2
+# Mostrar últimas líneas del log que deberían tener el Process Tree
+echo "Process Tree del detector:"
+tail -30 /tmp/edr_alerts.log | grep -A 20 "🌳 PROCESS TREE:" | sed 's/^/   /'
 
 
 # Cleanup

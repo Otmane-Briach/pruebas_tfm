@@ -50,6 +50,18 @@ echo "   Modo: Trazabilidad completa del scoring"
 # Activar modo verbose para el scoring
 export EDR_VERBOSE_SCORING=1
 
+# Configurar Response Engine (por defecto monitor)
+if [ "$1" = "--block" ]; then
+    export EDR_RESPONSE_MODE=block
+    echo "   Response Engine: BLOCK MODE"
+elif [ "$1" = "--kill" ]; then
+    export EDR_RESPONSE_MODE=kill
+    echo "   Response Engine: KILL MODE"
+else
+    export EDR_RESPONSE_MODE=monitor
+    echo "   Response Engine: MONITOR MODE (solo alertas)"
+fi
+
 # Iniciar pipeline con verbose scoring
 sudo python3 collector.py --verbose --no-hash 2>/tmp/edr.err | \
     tee /tmp/edr_scoring.log | \
@@ -231,6 +243,82 @@ else
     echo -e "${RED}❌ RANSOMWARE REAL NO DETECTADO${NC}"
 fi
 
+
+# ==========================================
+# TEST 3.5: DETECCIÓN DE PERSISTENCIA
+# ==========================================
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BLUE}TEST 3.5: DETECCIÓN DE PERSISTENCIA${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Simulando intentos de persistencia..."
+
+# Test crontab
+echo "Intentando modificar crontab (simulado)..."
+echo "* * * * * /tmp/backdoor.sh" > "$TEST_DIR/fake_crontab"
+cat "$TEST_DIR/fake_crontab" > /dev/null
+
+# Test bashrc
+echo "Creando .bashrc malicioso..."
+echo "alias sudo='echo pwned && sudo'" > "$TEST_DIR/.bashrc"
+
+# Test systemd (simulado)
+echo "Creando servicio systemd falso..."
+cat > "$TEST_DIR/backdoor.service" << EOF
+[Unit]
+Description=Backdoor
+
+[Service]
+ExecStart=/tmp/backdoor
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sleep 2
+
+# Verificar detección
+PERSISTENCE_ALERTS=$(grep -c "PERSISTENCIA" /tmp/edr_alerts.log 2>/dev/null || echo "0")
+if [ "$PERSISTENCE_ALERTS" -gt "0" ]; then
+    echo -e "${GREEN}✅ PERSISTENCIA DETECTADA${NC}"
+    echo "   Alertas de persistencia:"
+    grep "PERSISTENCIA" /tmp/edr_alerts.log | tail -3 | sed 's/^/      /'
+else
+    echo -e "${YELLOW}⚠ Persistencia no detectada (puede requerir permisos root)${NC}"
+fi
+
+# ==========================================
+# TEST 3.6: RESPONSE ENGINE
+# ==========================================
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BLUE}TEST 3.6: RESPONSE ENGINE${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Verificar modo actual
+RESPONSE_MODE=${EDR_RESPONSE_MODE:-monitor}
+echo "Modo Response Engine: $RESPONSE_MODE"
+
+if [ "$RESPONSE_MODE" = "monitor" ]; then
+    echo -e "${YELLOW}⚠ Response Engine en modo MONITOR (solo alertas)${NC}"
+    echo "   Para probar respuestas activas, ejecutar con:"
+    echo "   EDR_RESPONSE_MODE=block ./testing_sistema.sh"
+else
+    echo -e "${GREEN}✓ Response Engine en modo $RESPONSE_MODE${NC}"
+    
+    # Contar respuestas en logs
+    BLOCKS=$(grep -c "RESPONSE BLOCK" /tmp/edr_alerts.log 2>/dev/null || echo "0")
+    KILLS=$(grep -c "RESPONSE KILL" /tmp/edr_alerts.log 2>/dev/null || echo "0")
+    
+    echo "   Acciones ejecutadas:"
+    echo "     Procesos bloqueados: $BLOCKS"
+    echo "     Procesos terminados: $KILLS"
+    
+    if [ "$BLOCKS" -gt "0" ] || [ "$KILLS" -gt "0" ]; then
+        echo -e "${GREEN}✅ RESPONSE ENGINE ACTIVO Y FUNCIONANDO${NC}"
+    fi
+fi
+
 # ==========================================
 # TEST 4: ANÁLISIS DE LOGS VERBOSE
 # ==========================================
@@ -323,6 +411,9 @@ else
     echo -e "   ${YELLOW}⚠ Revisar balance individual vs compuesto${NC}"
 fi
 
+
+
+
 # Test 4: Múltiples tipos de indicadores
 INDICATOR_TYPES=$(grep "SCORING PID" /tmp/edr_alerts.log | grep -o '\[[^]]*\]' | sort | uniq | wc -l)
 if [ "$INDICATOR_TYPES" -ge "3" ]; then
@@ -354,6 +445,11 @@ else
     echo "   Implementación de scoring necesita ajustes"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+
+
+
+
 
 # Cleanup
 echo

@@ -189,19 +189,37 @@ TRACEPOINT_PROBE(syscalls, sys_enter_fchmodat) {
     return 0;
 }
 
-// NUEVA SYSCALL: connect
+// NUEVA SYSCALL: connect con IP:Puerto
 TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
     struct event_t data = {};
     u64 pid_tgid = bpf_get_current_pid_tgid();
     data.type = 5;
     data.pid = pid_tgid >> 32;
     data.ppid = get_ppid();
-    data.flags = 0;
+    
+    // Capturar IP y puerto (IPv4) - FORMA CORREGIDA
+    // En lugar de usar struct sockaddr, leer bytes directamente
+    void *addr = (void *)args->uservaddr;
+    if (addr) {
+        u16 family = 0;
+        bpf_probe_read(&family, sizeof(family), addr);
+        
+        if (family == 2) {  // AF_INET
+            // Para IPv4: family(2) + port(2) + ip(4)
+            // Leer IP (offset 4 bytes desde inicio)
+            bpf_probe_read(&data.flags, 4, (char*)addr + 4);
+            // Leer puerto (offset 2 bytes desde inicio)  
+            u16 port = 0;
+            bpf_probe_read(&port, 2, (char*)addr + 2);
+            // Guardar puerto en los primeros bytes del filename
+            *(u16*)data.filename = ntohs(port);
+        }
+    }
+    
     u64 uid_gid = bpf_get_current_uid_gid();
     data.uid = uid_gid & 0xFFFFFFFF;
     data.gid = uid_gid >> 32;
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    data.filename[0] = '\0';
     events.perf_submit(args, &data, sizeof(data));
     return 0;
 }
@@ -437,6 +455,25 @@ def handle_event(cpu, data, size):
         elif event.type == 5:  # CONNECT
             output["operation"] = "NETWORK_CONNECT"
             connect_event_count += 1
+            
+            # Decodificar IP:Puerto si está disponible
+            if event.flags != 0:  # flags contiene la IP
+                import socket
+                import struct
+                try:
+                    ip = socket.inet_ntoa(struct.pack('<I', event.flags))
+                    port = struct.unpack('<H', event.filename[:2])[0] if event.filename else 0
+                    output["dest_ip"] = ip
+                    output["dest_port"] = port
+                    output["connection"] = f"{ip}:{port}"
+                    
+                    # Detectar C2 conocidos
+                    KNOWN_C2 = ['192.168.1.100', '10.0.0.50']  # Ejemplos
+                    if ip in KNOWN_C2:
+                        output["suspicious_c2"] = True
+                        output["alert"] = f"C2 connection to {ip}:{port}"
+                except:
+                    pass
             
             # Detectar conexiones sospechosas
             if event.uid != 0:  # Procesos no-root haciendo conexiones

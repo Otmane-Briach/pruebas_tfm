@@ -14,6 +14,7 @@ import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+import subprocess
 
 @dataclass
 class Event:
@@ -76,6 +77,10 @@ class ProcessScoreTracker:
             # +2 PUNTOS: Prevalencia media (50-80%) y especificidad media (2-5% FP)
             'tmp_execution': 2,            # Ejecución desde /tmp
             'kill_process': 2,             # pkill/kill
+            'persistence_cron': 3,          # Modificación de crontab
+            'persistence_systemd': 3,       # Nuevo servicio systemd
+            'persistence_bashrc': 2,        # Modificación .bashrc/.profile
+            'persistence_ldpreload': 3,     # LD_PRELOAD hijacking
             'setuid_chmod': 2,             # chmod SETUID/SETGID
             
             # +1 PUNTO: Baja prevalencia (<50%) y especificidad (>5% FP)
@@ -85,12 +90,33 @@ class ProcessScoreTracker:
             'o_trunc': 1,                  # O_TRUNC flag
             
             # +1 BONUS: Co-ocurrencia
-            'cooccurrence': 1              # Múltiples indicadores juntos
+            'cooccurrence': 1,              # Múltiples indicadores juntos
+            
         }
         
         self.alert_threshold = 6  # Umbral según tu documento
         self.time_window = 10      # Ventana de 10 segundos
         self.alerted_pids = set()  # Anti-spam
+        # MITRE ATT&CK Mapping
+        self.mitre_mapping = {
+            'locked_files_burst': ['T1486'],      # Data Encrypted for Impact
+            'massive_write': ['T1486', 'T1565.001'],  # Data Encrypted + Data Manipulation
+            'unlink_burst': ['T1485'],            # Data Destruction
+            'ransom_note': ['T1486'],              # Data Encrypted for Impact
+            'tmp_execution': ['T1036.005'],        # Masquerading: Match Legitimate Name/Location
+            'kill_process': ['T1489'],             # Service Stop
+            'setuid_chmod': ['T1548.001'],         # Setuid and Setgid
+            'chmod_regular': ['T1222.002'],        # File/Directory Permissions Modification
+            'mmap_exec': ['T1055.001'],            # Dynamic-link Library Injection
+            'ptrace_use': ['T1055.008'],           # Process Injection: Ptrace
+            'o_trunc': ['T1565.001'],              # Data Manipulation
+            'persistence_cron': ['T1053.003'],       # Scheduled Task/Job: Cron
+            'persistence_systemd': ['T1543.002'],    # Create or Modify System Process: Systemd
+            'persistence_bashrc': ['T1546.004'],     # Event Triggered Execution: .bash_profile
+            'persistence_ldpreload': ['T1574.006'],  # Hijack Execution Flow: LD_PRELOAD
+            'cooccurrence': []                     # No MITRE específico
+            
+        }
     
     def add_indicator(self, pid: int, indicator: str, event_time: float, verbose: bool = False) -> Optional[str]:
         """Actualizar score y verificar umbral"""
@@ -141,9 +167,22 @@ class ProcessScoreTracker:
             if current_score >= self.alert_threshold and pid not in self.alerted_pids:
                 self.alerted_pids.add(pid)
                 indicators = [f"{e[1]}(+{e[2]})" for e in proc['window_events']]
-                # Limpiar ventana después de alertar
+                
+                # Recopilar técnicas MITRE únicas
+                mitre_techniques = set()
+                for e in proc['window_events']:
+                    techniques = self.mitre_mapping.get(e[1], [])
+                    mitre_techniques.update(techniques)
+                
+                mitre_str = f" [MITRE: {', '.join(sorted(mitre_techniques))}]" if mitre_techniques else ""
+                
                 proc['window_events'].clear()
-                return f"RANSOMWARE [SCORE {current_score}]: {', '.join(indicators)} (PID {pid})"
+                alert_msg = f"RANSOMWARE [SCORE {current_score}]: {', '.join(indicators)} (PID {pid}){mitre_str}"
+                
+                # Guardar score para Response Engine
+                proc['last_score'] = current_score
+                
+                return alert_msg
         
         return None
 
@@ -160,10 +199,23 @@ class ThreatDetectorFixed:
         # Sistema de scoring unificado
         self.score_tracker = ProcessScoreTracker()
         self.verbose_scoring = os.environ.get('EDR_VERBOSE_SCORING', '0') == '1'
+
+        # Response Engine Configuration
+        self.response_mode = os.environ.get('EDR_RESPONSE_MODE', 'monitor').lower()
+        self.response_thresholds = {
+            'block': 6,   # SIGSTOP para score >= 6
+            'kill': 8     # SIGKILL para score >= 8
+        }
+        self.blocked_pids = set()  # PIDs bloqueados con SIGSTOP
+        self.killed_pids = set()   # PIDs terminados con SIGKILL
         
         # Ventanas para nuevas syscalls
         self.deletion_windows = defaultdict(deque)  # Ventana para UNLINK
         self.chmod_windows = defaultdict(deque)     # Ventana para CHMOD
+
+        # Ventanas para detección de persistencia
+        self.persistence_windows = defaultdict(deque)
+        self.persistence_alerted = set()
 
         # Contadores específicos
         self.deletion_patterns = {
@@ -245,7 +297,20 @@ class ThreatDetectorFixed:
                 0o2000: "SETGID",  # Group privilege
                 0o777:  "WORLD_ALL",  # World writable/executable
                 0o666:  "WORLD_RW"    # World readable/writable
+            },
+            # NUEVO: Archivos de persistencia
+            "persistence_files": {
+                "/etc/crontab", "/etc/cron.d/", "/var/spool/cron/",
+                "/etc/systemd/system/", "/lib/systemd/system/", 
+                "/etc/init.d/", "/etc/rc.local",
+                "/.bashrc", "/.profile", "/.bash_profile",
+                "/etc/ld.so.preload", "/etc/ld.so.conf",
+                "/etc/passwd", "/etc/shadow", "/etc/sudoers"
+            },
+            "persistence_extensions": {
+                ".service", ".timer", ".sh"
             }
+
         }
         
         # Estadísticas MEJORADAS con soporte WRITE - ARREGLADO
@@ -282,7 +347,18 @@ class ThreatDetectorFixed:
             "network_alerts": 0,
             "injection_alerts": 0,
             "memory_alerts": 0,
-            "ownership_alerts": 0
+            "ownership_alerts": 0,
+            # Estadísticas de persistencia
+            "persistence_attempts": 0,
+            "persistence_cron": 0,
+            "persistence_systemd": 0,
+            "persistence_bashrc": 0,
+            "persistence_ldpreload": 0,
+            # Response Engine stats
+            "response_blocks": 0,
+            "response_kills": 0,
+            "response_failures": 0
+
 
         }
         
@@ -419,6 +495,11 @@ class ThreatDetectorFixed:
     def _signal_handler(self, signum, frame):
         """Manejo de señales"""
         self.running = False
+        # Desbloquear procesos suspendidos antes de salir
+        if self.blocked_pids:
+            print(f"Desbloqueando {len(self.blocked_pids)} procesos...", file=sys.stderr)
+            for pid in list(self.blocked_pids):
+                self._unblock_process(pid)
         self.print_final_stats()
         self._cleanup_database()
         sys.exit(0)
@@ -544,6 +625,19 @@ class ThreatDetectorFixed:
             
             # Retornar alerta si existe
             if alert_message:
+                # Ejecutar Response Engine si hay score alto
+                if "RANSOMWARE [SCORE" in alert_message:
+                    # Extraer score del mensaje
+                    import re
+                    score_match = re.search(r'\[SCORE (\d+)\]', alert_message)
+                    if score_match:
+                        score = int(score_match.group(1))
+                        # Solo ejecutar si no es un proceso protegido
+                        if event.comm not in ['bash', 'sh', 'testing_sistema']:
+                            response_executed = self._execute_response(event.pid, score, event.comm, alert_message)
+                            if response_executed:
+                                print(f"RESPONSE: Acción tomada contra {event.comm} (PID {event.pid})", file=sys.stderr)
+                
                 return alert_message
                 
             return None
@@ -805,6 +899,11 @@ class ThreatDetectorFixed:
         if alert:
             self.stats["alerts_by_type"]["ownership_manipulation"] += 1
             return alert
+        
+        alert = self._check_persistence_attempt(event)
+        if alert:
+            self.stats["alerts_by_type"]["persistence"] += 1
+            return alert
 
         return None
     
@@ -852,10 +951,10 @@ class ThreatDetectorFixed:
         window.append(current_time)
         
         # Si hay >5 archivos .locked en 10s → +3 puntos
-        if len(window) >= self.config["file_burst_threshold"]:  # Umbral según tu documento
+        if len(window) >= self.config["file_burst_threshold"]:
             alert = self.score_tracker.add_indicator(pid, 'locked_files_burst', current_time, verbose=self.verbose_scoring)
             if alert:
-                return alert
+                return alert  # Ya incluye MITRE desde add_indicator
         
         return None
     
@@ -959,7 +1058,7 @@ class ThreatDetectorFixed:
         if user_files_deleted >= self.config["critical_deletion_threshold"]:
             self.mass_deletion_alerted.add(pid)
             self.stats["ransomware_deletion_patterns"] += 1
-            return f"PATRÓN RANSOMWARE: {user_files_deleted} archivos de usuario borrados (PID {pid})"
+            return f"PATRÓN RANSOMWARE: {user_files_deleted} archivos de usuario borrados (PID {pid}) [MITRE: T1485, T1486]"
         
         return None
 
@@ -1023,7 +1122,7 @@ class ThreatDetectorFixed:
         # Alerta individual para SETUID/SETGID
         if "SETUID" in suspicious_perms or "SETGID" in suspicious_perms:
             if event.path and any(critical in event.path for critical in ["/tmp", "/dev/shm", "/var/tmp"]):
-                return f"ALERTA CRÍTICA: {suspicious_perms[0]} en ubicación sospechosa: {event.path}"
+                return f"ALERTA CRÍTICA: {suspicious_perms[0]} en ubicación sospechosa: {event.path} [MITRE: T1548.001]"
         
         return None
 
@@ -1036,7 +1135,7 @@ class ThreatDetectorFixed:
             
         if event.suspicious_connect:
             self.stats["network_alerts"] += 1
-            return f"CONEXIÓN SOSPECHOSA: Proceso no-root {event.comm} (PID {event.pid})"
+            return f"CONEXIÓN SOSPECHOSA: Proceso no-root {event.comm} (PID {event.pid}) [MITRE: T1071]"
         
         return None
     
@@ -1076,9 +1175,182 @@ class ThreatDetectorFixed:
             
         if event.suspicious_chown:
             self.stats["ownership_alerts"] += 1
-            return f"CAMBIO PROPIETARIO SOSPECHOSO: a UID {event.new_owner} por {event.comm} (PID {event.pid})"
+            return f"CAMBIO PROPIETARIO SOSPECHOSO: a UID {event.new_owner} por {event.comm} (PID {event.pid}) [MITRE: T1222.002]"
         
         return None
+    
+    def _check_persistence_attempt(self, event: Event) -> Optional[str]:
+        """
+        Detectar intentos de establecer persistencia
+        MITRE: T1053, T1543, T1546, T1574
+        """
+        if event.event_type not in ["OPEN", "WRITE", "EXEC"]:
+            return None
+            
+        if not event.path:
+            return None
+            
+        pid = event.pid
+        current_time = event.timestamp
+        
+        # Anti-spam
+        if pid in self.persistence_alerted:
+            return None
+        
+        # Verificar si es archivo de persistencia
+        persistence_type = None
+        mitre_technique = None
+        
+        # Crontab
+        if any(cron in event.path for cron in ["/etc/crontab", "/cron.d/", "/var/spool/cron/"]):
+            if event.event_type == "OPEN" and event.flags and (event.flags & 0x1 or event.flags & 0x2):  # WRITE
+                persistence_type = "persistence_cron"
+                mitre_technique = "T1053.003"
+                self.stats["persistence_cron"] += 1
+                
+        # Systemd
+        elif any(systemd in event.path for systemd in ["/systemd/system/", "/init.d/"]):
+            if event.path.endswith(".service") or event.path.endswith(".timer"):
+                persistence_type = "persistence_systemd"
+                mitre_technique = "T1543.002"
+                self.stats["persistence_systemd"] += 1
+                
+        # Bashrc/Profile
+        elif any(profile in event.path for profile in [".bashrc", ".profile", ".bash_profile"]):
+            if event.event_type == "OPEN" and event.flags and (event.flags & 0x1 or event.flags & 0x2):
+                persistence_type = "persistence_bashrc"
+                mitre_technique = "T1546.004"
+                self.stats["persistence_bashrc"] += 1
+                
+        # LD_PRELOAD
+        elif "ld.so.preload" in event.path or "ld.so.conf" in event.path:
+            persistence_type = "persistence_ldpreload"
+            mitre_technique = "T1574.006"
+            self.stats["persistence_ldpreload"] += 1
+        
+        if persistence_type:
+            self.stats["persistence_attempts"] += 1
+            
+            # Añadir al scoring
+            alert = self.score_tracker.add_indicator(pid, persistence_type, current_time, verbose=self.verbose_scoring)
+            if alert:
+                self.persistence_alerted.add(pid)
+                return alert
+            
+            # Alerta directa para LD_PRELOAD (muy sospechoso)
+            if persistence_type == "persistence_ldpreload":
+                self.persistence_alerted.add(pid)
+                return f"⚠️ PERSISTENCIA CRÍTICA: LD_PRELOAD hijacking por {event.comm} (PID {pid}) [MITRE: {mitre_technique}]"
+            
+            # Alerta informativa para otros tipos
+            if event.uid != 0:  # Usuario no-root modificando archivos de sistema
+                return f"PERSISTENCIA SOSPECHOSA: {event.comm} modificando {event.path} [MITRE: {mitre_technique}]"
+        
+        return None
+    
+    def _execute_response(self, pid: int, score: int, comm: str, reason: str) -> bool:
+        """
+        Ejecutar respuesta según modo configurado y score
+        Retorna True si se ejecutó alguna acción
+        """
+        if self.response_mode == 'monitor':
+            return False
+            
+        # No responder a procesos del sistema o al script de testing
+        protected_procs = ['systemd', 'init', 'kernel', 'bash', 'sh', 'testing_sistema']
+        if pid == 1 or comm in protected_procs or 'testing' in comm.lower():
+            print(f"RESPONSE: Ignorando proceso protegido {comm} (PID {pid})", file=sys.stderr)
+            return False
+            
+        # No actuar sobre el PID del pipeline principal
+        if pid == os.getppid():  # Parent PID
+            print(f"RESPONSE: Ignorando proceso padre {comm} (PID {pid})", file=sys.stderr)
+            return False
+            
+        # Verificar si ya fue procesado
+        if pid in self.killed_pids:
+            return False
+            
+        action_taken = False
+        
+        # KILL MODE: Terminar si score >= umbral kill
+        if self.response_mode == 'kill' and score >= self.response_thresholds['kill']:
+            if self._kill_process(pid, comm, reason):
+                self.killed_pids.add(pid)
+                self.stats["response_kills"] += 1
+                action_taken = True
+                print(f"🔴 RESPONSE KILL: Proceso {comm} (PID {pid}) terminado - Score: {score}", file=sys.stderr)
+                
+        # BLOCK MODE: Suspender si score >= umbral block
+        elif self.response_mode in ['block', 'kill'] and score >= self.response_thresholds['block']:
+            if pid not in self.blocked_pids:
+                if self._block_process(pid, comm, reason):
+                    self.blocked_pids.add(pid)
+                    self.stats["response_blocks"] += 1
+                    action_taken = True
+                    print(f"🟡 RESPONSE BLOCK: Proceso {comm} (PID {pid}) suspendido - Score: {score}", file=sys.stderr)
+                    
+        return action_taken
+    
+    def _kill_process(self, pid: int, comm: str, reason: str) -> bool:
+        """Terminar proceso con SIGKILL"""
+        try:
+            # Verificar que el proceso existe
+            if not os.path.exists(f"/proc/{pid}"):
+                return False
+                
+            # Verificar que no es proceso root crítico
+            with open(f"/proc/{pid}/status", 'r') as f:
+                status = f.read()
+                if "Uid:\t0\t" in status and comm in ['sshd', 'systemd', 'init']:
+                    print(f"RESPONSE: No matando proceso root crítico {comm}", file=sys.stderr)
+                    return False
+            
+            # Ejecutar kill
+            os.kill(pid, 9)  # SIGKILL
+            print(f"RESPONSE: Proceso {pid} ({comm}) terminado: {reason}", file=sys.stderr)
+            return True
+            
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+        except PermissionError:
+            self.stats["response_failures"] += 1
+            print(f"RESPONSE ERROR: Sin permisos para terminar {pid}", file=sys.stderr)
+            return False
+        except Exception as e:
+            self.stats["response_failures"] += 1
+            print(f"RESPONSE ERROR: {e}", file=sys.stderr)
+            return False
+    
+    def _block_process(self, pid: int, comm: str, reason: str) -> bool:
+        """Suspender proceso con SIGSTOP"""
+        try:
+            if not os.path.exists(f"/proc/{pid}"):
+                return False
+                
+            os.kill(pid, 19)  # SIGSTOP
+            print(f"RESPONSE: Proceso {pid} ({comm}) suspendido: {reason}", file=sys.stderr)
+            return True
+            
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+        except PermissionError:
+            self.stats["response_failures"] += 1
+            print(f"RESPONSE ERROR: Sin permisos para suspender {pid}", file=sys.stderr)
+            return False
+        except Exception as e:
+            self.stats["response_failures"] += 1
+            print(f"RESPONSE ERROR: {e}", file=sys.stderr)
+            return False
+    
+    def _unblock_process(self, pid: int) -> bool:
+        """Reanudar proceso con SIGCONT"""
+        try:
+            os.kill(pid, 18)  # SIGCONT
+            self.blocked_pids.discard(pid)
+            return True
+        except:
+            return False
         
     def print_stats(self):
         """Mostrar estadísticas en tiempo real con DEBUG WRITE"""
@@ -1182,7 +1454,7 @@ class ThreatDetectorFixed:
             print(f"    Pocos eventos WRITE para evaluar ({self.stats['write_events']})", file=sys.stderr)
         
         
-        print(f"\n📊 NUEVAS SYSCALLS:", file=sys.stderr)
+        print(f"\n NUEVAS SYSCALLS:", file=sys.stderr)
         print(f"   Eventos UNLINK: {self.stats['unlink_events']}", file=sys.stderr)
         print(f"   Eventos CHMOD: {self.stats['chmod_events']}", file=sys.stderr)
         print(f"   Borrados masivos detectados: {self.stats['mass_deletions_detected']}", file=sys.stderr)
@@ -1197,12 +1469,43 @@ class ThreatDetectorFixed:
         print(f"   Alertas de memoria: {self.stats['memory_alerts']}", file=sys.stderr)
         print(f"   Alertas de ownership: {self.stats['ownership_alerts']}", file=sys.stderr)
         
-        print(f"\n🎯 SISTEMA DE SCORING UNIFICADO:", file=sys.stderr)
+        print(f"\n SISTEMA DE SCORING UNIFICADO:", file=sys.stderr)
         print(f"   Umbral configurado: >{self.score_tracker.alert_threshold} puntos", file=sys.stderr)
         print(f"   Ventana temporal: {self.score_tracker.time_window}s", file=sys.stderr)
         print(f"   PIDs que alcanzaron umbral: {len(self.score_tracker.alerted_pids)}", file=sys.stderr)
         if self.verbose_scoring:
             print(f"   Modo verbose: ACTIVO", file=sys.stderr)
+        
+        # Estadísticas MITRE ATT&CK
+        print(f"\n COBERTURA MITRE ATT&CK:", file=sys.stderr)
+        mitre_covered = set()
+        for techniques in self.score_tracker.mitre_mapping.values():
+            mitre_covered.update(techniques)
+        mitre_covered.discard('')  # Quitar vacíos
+        
+        print(f"   Técnicas MITRE cubiertas: {len(mitre_covered)}", file=sys.stderr)
+        print(f"   Técnicas: {', '.join(sorted(mitre_covered))}", file=sys.stderr)
+        print(f"   Cobertura táctica:", file=sys.stderr)
+        print(f"     - Persistence: T1548", file=sys.stderr)
+        print(f"     - Defense Evasion: T1036, T1055", file=sys.stderr)
+        print(f"     - Impact: T1485, T1486, T1489", file=sys.stderr)
+
+        print(f"\n🔐 DETECCIÓN DE PERSISTENCIA:", file=sys.stderr)
+        print(f"   Intentos de persistencia: {self.stats['persistence_attempts']}", file=sys.stderr)
+        print(f"   Modificaciones crontab: {self.stats['persistence_cron']}", file=sys.stderr)
+        print(f"   Servicios systemd: {self.stats['persistence_systemd']}", file=sys.stderr)
+        print(f"   Modificaciones .bashrc: {self.stats['persistence_bashrc']}", file=sys.stderr)
+        print(f"   LD_PRELOAD hijacking: {self.stats['persistence_ldpreload']}", file=sys.stderr)
+        
+        print(f"\n⚔️ RESPONSE ENGINE:", file=sys.stderr)
+        print(f"   Modo configurado: {self.response_mode.upper()}", file=sys.stderr)
+        if self.response_mode != 'monitor':
+            print(f"   Procesos bloqueados (SIGSTOP): {self.stats['response_blocks']}", file=sys.stderr)
+            print(f"   Procesos terminados (SIGKILL): {self.stats['response_kills']}", file=sys.stderr)
+            print(f"   Fallos de respuesta: {self.stats['response_failures']}", file=sys.stderr)
+            print(f"   Umbrales: Block={self.response_thresholds['block']}, Kill={self.response_thresholds['kill']}", file=sys.stderr)
+            if self.blocked_pids:
+                print(f"   PIDs bloqueados activos: {list(self.blocked_pids)}", file=sys.stderr)
 
         print("="*60, file=sys.stderr)
          

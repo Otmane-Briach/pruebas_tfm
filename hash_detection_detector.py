@@ -55,10 +55,33 @@ class Event:
     suspicious_mmap: Optional[bool] = None
     suspicious_chown: Optional[bool] = None
 
+class ProcessTree:
+    def __init__(self):
+        self.tree = {}
+    
+    def add_process(self, pid: int, ppid: int, exe: str):
+        if pid not in self.tree:
+            self.tree[pid] = {'ppid': ppid, 'children': [], 'exe': exe, 'score': 0, 'events': []}
+        if ppid in self.tree:
+            self.tree[ppid]['children'].append(pid)
+    
+    def update_score(self, pid: int, score: int):
+        if pid in self.tree:
+            self.tree[pid]['score'] = score
+    
+    def get_family_score(self, pid: int) -> int:
+        if pid not in self.tree:
+            return 0
+        total = self.tree[pid]['score']
+        for child in self.tree[pid]['children']:
+            total += self.get_family_score(child)
+        return total
+
 class ProcessScoreTracker:
     """Sistema de scoring unificado basado en ESCAPADE/LeARN"""
     
-    def __init__(self):
+    def __init__(self, detector=None):  
+        self.detector = detector   
         self.process_scores = defaultdict(lambda: {
             'score': 0,
             'indicators': [],
@@ -148,6 +171,19 @@ class ProcessScoreTracker:
             proc['window_events'].append((event_time, indicator, points))
             proc['last_update'] = event_time
             
+            # Response inmediato para indicadores críticos - VA AQUÍ, DENTRO DEL IF
+          # CRITICAL_INDICATORS = {'locked_files_burst', 'unlink_burst', 'massive_write'}
+          #  if indicator in CRITICAL_INDICATORS and os.environ.get('EDR_RESPONSE_MODE', 'monitor') != 'monitor':
+          #      if pid not in self.alerted_pids:
+          #          try:
+          #              os.kill(pid, 19)  # SIGSTOP inmediato
+          #              print(f" EMERGENCY STOP: PID {pid} - {indicator} detectado", file=sys.stderr)
+          #              # Marcar para revisión posterior
+          #              if self.detector and hasattr(self.detector, 'emergency_stopped'):
+          #                  self.detector.emergency_stopped.add(pid)
+           #         except:
+            #            pass
+            
             # Calcular score actual
             current_score = sum(e[2] for e in proc['window_events'])
             
@@ -183,8 +219,7 @@ class ProcessScoreTracker:
                 proc['last_score'] = current_score
                 
                 return alert_msg
-        
-        return None
+        return None  # Este return None va FUERA del if points > 0
 
 class ThreatDetectorFixed:
     """Detector WRITE CORREGIDO con umbrales realistas"""
@@ -197,7 +232,7 @@ class ThreatDetectorFixed:
         self.exec_windows = defaultdict(deque)
 
         # Sistema de scoring unificado
-        self.score_tracker = ProcessScoreTracker()
+        self.score_tracker = ProcessScoreTracker(self)  # <-- AÑADIR self aquí
         self.verbose_scoring = os.environ.get('EDR_VERBOSE_SCORING', '0') == '1'
 
         # Response Engine Configuration
@@ -208,6 +243,9 @@ class ThreatDetectorFixed:
         }
         self.blocked_pids = set()  # PIDs bloqueados con SIGSTOP
         self.killed_pids = set()   # PIDs terminados con SIGKILL
+
+        self.process_tree = ProcessTree()
+        self.emergency_stopped = set()  # PIDs detenidos de emergencia
         
         # Ventanas para nuevas syscalls
         self.deletion_windows = defaultdict(deque)  # Ventana para UNLINK
@@ -540,7 +578,11 @@ class ThreatDetectorFixed:
                 scan_method=event_data.get("scan_method", ""),
                 bytes_written=event_data.get("bytes_written", 0)
             )
-            
+
+            # Tracking de process tree
+            if event.event_type == "EXEC":
+                self.process_tree.add_process(event.pid, event.ppid, event.comm)
+
             # DEBUG: Si el evento es WRITE, imprime un mensaje de debug mostrando el PID y los bytes escritos
             if event.event_type == "WRITE":
                 print(f"DEBUG WRITE: PID {event.pid}, bytes: {event.bytes_written}", file=sys.stderr)
@@ -572,6 +614,23 @@ class ThreatDetectorFixed:
             elif event_data.get("type") == "CONNECT":
                 event.suspicious_connect = event_data.get("suspicious_connect", False)
                 self.stats["connect_events"] += 1
+                
+                # Network attribution
+                if "dest_ip" in event_data:
+                    # Tracking de conexiones por proceso
+                    if event.pid in self.process_tree.tree:
+                        if 'connections' not in self.process_tree.tree[event.pid]:
+                            self.process_tree.tree[event.pid]['connections'] = []
+                        self.process_tree.tree[event.pid]['connections'].append({
+                            'ip': event_data.get("dest_ip"),
+                            'port': event_data.get("dest_port"),
+                            'time': event.timestamp
+                        })
+                    
+                    # Alerta si es C2
+                    if event_data.get("suspicious_c2"):
+                        alert_message = f"C2 DETECTED: {event.comm} connecting to {event_data['connection']}"
+                        self.stats["alerts_by_type"]["c2_connection"] += 1
             
             elif event_data.get("type") == "PTRACE":
                 event.ptrace_request = event_data.get("ptrace_request")
@@ -1253,6 +1312,19 @@ class ThreatDetectorFixed:
         Ejecutar respuesta según modo configurado y score
         Retorna True si se ejecutó alguna acción
         """
+        # Revisar si fue detenido de emergencia
+        if pid in self.emergency_stopped:
+            family_score = self.process_tree.get_family_score(pid)
+            if family_score < 6:
+                # Falsa alarma, reanudar
+                try:
+                    os.kill(pid, 18)  # SIGCONT
+                    self.emergency_stopped.discard(pid)
+                    print(f"✓ Reanudando {comm} (PID {pid}) - Score familiar: {family_score}", file=sys.stderr)
+                except:
+                    pass
+                return False
+
         if self.response_mode == 'monitor':
             return False
             
@@ -1490,14 +1562,14 @@ class ThreatDetectorFixed:
         print(f"     - Defense Evasion: T1036, T1055", file=sys.stderr)
         print(f"     - Impact: T1485, T1486, T1489", file=sys.stderr)
 
-        print(f"\n🔐 DETECCIÓN DE PERSISTENCIA:", file=sys.stderr)
+        print(f"\n DETECCIÓN DE PERSISTENCIA:", file=sys.stderr)
         print(f"   Intentos de persistencia: {self.stats['persistence_attempts']}", file=sys.stderr)
         print(f"   Modificaciones crontab: {self.stats['persistence_cron']}", file=sys.stderr)
         print(f"   Servicios systemd: {self.stats['persistence_systemd']}", file=sys.stderr)
         print(f"   Modificaciones .bashrc: {self.stats['persistence_bashrc']}", file=sys.stderr)
         print(f"   LD_PRELOAD hijacking: {self.stats['persistence_ldpreload']}", file=sys.stderr)
         
-        print(f"\n⚔️ RESPONSE ENGINE:", file=sys.stderr)
+        print(f"\n RESPONSE ENGINE:", file=sys.stderr)
         print(f"   Modo configurado: {self.response_mode.upper()}", file=sys.stderr)
         if self.response_mode != 'monitor':
             print(f"   Procesos bloqueados (SIGSTOP): {self.stats['response_blocks']}", file=sys.stderr)
@@ -1506,6 +1578,17 @@ class ThreatDetectorFixed:
             print(f"   Umbrales: Block={self.response_thresholds['block']}, Kill={self.response_thresholds['kill']}", file=sys.stderr)
             if self.blocked_pids:
                 print(f"   PIDs bloqueados activos: {list(self.blocked_pids)}", file=sys.stderr)
+
+        print(f"\n🌳 PROCESS TREE:", file=sys.stderr)
+        suspicious_families = [(pid, info) for pid, info in self.process_tree.tree.items() 
+                              if info['score'] > 0 or len(info.get('connections', [])) > 0]
+        if suspicious_families:
+            for pid, info in suspicious_families[:5]:  # Top 5
+                print(f"   PID {pid} ({info['exe']}): Score={info['score']}", file=sys.stderr)
+                if 'connections' in info:
+                    for conn in info['connections'][:3]:
+                        print(f"      → {conn['ip']}:{conn['port']}", file=sys.stderr)
+
 
         print("="*60, file=sys.stderr)
          

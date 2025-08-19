@@ -117,7 +117,7 @@ class ProcessScoreTracker:
             
         }
         
-        self.alert_threshold = 6  # Umbral según tu documento
+        self.alert_threshold = 5  # Umbral según tu documento
         self.time_window = 10      # Ventana de 10 segundos
         self.alerted_pids = set()  # Anti-spam
         # MITRE ATT&CK Mapping
@@ -288,12 +288,12 @@ class ThreatDetectorFixed:
         
         # ahora sii: Umbrales WRITE REALISTAS para testing
         self.config = {
-            "file_burst_threshold": 5,# >5 archivos .locked según documento ESCAPADE/LeARN
+            "file_burst_threshold": 3,# >5 archivos .locked según documento ESCAPADE/LeARN
             "exec_burst_threshold": 3,
-            "time_window": 10,
+            "time_window": 30,
             # UMBRALES WRITE AJUSTADOS PARA TESTING
-            "write_ops_threshold": 50,            # 50 operaciones (era 500)
-            "write_bytes_threshold": 20*1024*1024,  # 20MB (era 100MB)
+            "write_ops_threshold": 30,            # 50 operaciones (era 500)
+            "write_bytes_threshold": 10*1024*1024,  # 20MB (era 100MB)
             "write_reset_interval": 60,           # Reset cada 60s (era 30s)
             "write_alert_cooldown": 30,           # 30s entre alertas del mismo PID
             # Configuración existente
@@ -310,8 +310,18 @@ class ThreatDetectorFixed:
             },
             "suspicious_extensions": {
                 ".locked", ".enc", ".crypt", ".encrypt", ".encrypted",
-                ".vault", ".crypto", ".secure", ".ransomed"
+                ".vault", ".crypto", ".secure", ".ransomed",
+                # WannaCry REAL
+                ".WNCRY", ".WCRY", ".WNCRYT",
+                # LockBit 2025
+                ".lockbit", ".abcd",
+                # Conti
+                ".CONTI",
+                # Patrones con ID
+                ".id-", ".email-"
             },
+
+
 
             # Umbrales para UNLINK
             "deletion_burst_threshold": 10,  # 10 archivos en ventana
@@ -963,6 +973,12 @@ class ThreatDetectorFixed:
         if alert:
             self.stats["alerts_by_type"]["persistence"] += 1
             return alert
+        
+        # AÑADIR ANTES DEL return None FINAL
+        alert = self._check_ransomware_pattern_generic(event)
+        if alert:
+            self.stats["alerts_by_type"]["ransomware_pattern"] += 1
+            return alert
 
         return None
     
@@ -1065,6 +1081,32 @@ class ThreatDetectorFixed:
                         
         return None
     
+    def _check_ransomware_pattern_generic(self, event: Event) -> Optional[str]:
+        """Detectar ransomware por PATRÓN, no por extensión"""
+        if event.event_type == "OPEN" and event.flags and (event.flags & 0x40):
+            if event.path and '.' in event.path:
+                # Detectar doble extensión (file.doc.ALGO)
+                parts = event.path.split('.')
+                if len(parts) >= 3:
+                    # Es ransomware casi seguro
+                    alert = self.score_tracker.add_indicator(
+                        event.pid, 'locked_files_burst', event.timestamp,
+                        verbose=self.verbose_scoring
+                    )
+                    if alert:
+                        return alert
+                        
+        # Patrón create+delete
+        if event.event_type == "UNLINK":
+            if event.pid in self.file_windows and len(self.file_windows[event.pid]) > 0:
+                alert = self.score_tracker.add_indicator(
+                    event.pid, 'unlink_burst', event.timestamp,
+                    verbose=self.verbose_scoring
+                )
+                if alert:
+                    return alert
+        
+        return None
 
     def _check_mass_deletion(self, event: Event) -> Optional[str]:
         """

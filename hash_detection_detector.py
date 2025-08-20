@@ -96,6 +96,7 @@ class ProcessScoreTracker:
             'massive_write': 3,            # >20MB o >50 ops
             'unlink_burst': 3,             # >5 deletes en 10s
             'ransom_note': 3,              # Drop HTML/RTF
+            'massive_scan': 3
             
             # +2 PUNTOS: Prevalencia media (50-80%) y especificidad media (2-5% FP)
             'tmp_execution': 2,            # Ejecución desde /tmp
@@ -230,6 +231,7 @@ class ThreatDetectorFixed:
         # Ventanas de tiempo (existentes)
         self.file_windows = defaultdict(deque)
         self.exec_windows = defaultdict(deque)
+        self.scan_windows = defaultdict(deque)  
 
         # Sistema de scoring unificado
         self.score_tracker = ProcessScoreTracker(self)  # <-- AÑADIR self aquí
@@ -979,6 +981,12 @@ class ThreatDetectorFixed:
         if alert:
             self.stats["alerts_by_type"]["ransomware_pattern"] += 1
             return alert
+        
+        # AÑADIR ESTO NUEVO
+        alert = self._check_massive_scan(event)
+        if alert:
+            self.stats["alerts_by_type"]["massive_scan"] += 1
+            return alert
 
         return None
     
@@ -1088,13 +1096,16 @@ class ThreatDetectorFixed:
                 # Detectar doble extensión (file.doc.ALGO)
                 parts = event.path.split('.')
                 if len(parts) >= 3:
-                    # Es ransomware casi seguro
-                    alert = self.score_tracker.add_indicator(
-                        event.pid, 'locked_files_burst', event.timestamp,
-                        verbose=self.verbose_scoring
-                    )
-                    if alert:
-                        return alert
+                    # Verificar si la penúltima extensión es de archivo usuario
+                    user_extensions = {'doc', 'docx', 'pdf', 'txt', 'jpg', 'png', 'xls', 'xlsx'}
+                    if parts[-2].lower() in user_extensions:
+                        # Es ransomware casi seguro - archivo.doc.sougolock
+                        alert = self.score_tracker.add_indicator(
+                            event.pid, 'locked_files_burst', event.timestamp,
+                            verbose=self.verbose_scoring
+                        )
+                        if alert:
+                            return alert
                         
         # Patrón create+delete
         if event.event_type == "UNLINK":
@@ -1105,6 +1116,36 @@ class ThreatDetectorFixed:
                 )
                 if alert:
                     return alert
+        
+        return None
+
+    def _check_massive_scan(self, event: Event) -> Optional[str]:
+        """Detectar escaneo masivo de archivos (>1000 OPENs en 10s)"""
+        if event.event_type != "OPEN":
+            return None
+            
+        pid = event.pid
+        current_time = event.timestamp
+        
+        # Crear ventana si no existe
+        if pid not in self.scan_windows:
+            self.scan_windows[pid] = deque()
+        
+        window = self.scan_windows[pid]
+        
+        # Limpiar eventos viejos (>10 segundos)
+        while window and current_time - window[0] > 10:
+            window.popleft()
+        
+        window.append(current_time)
+        
+        # Si >1000 OPENs en 10 segundos = reconocimiento ransomware
+        if len(window) > 1000:
+            alert = self.score_tracker.add_indicator(
+                pid, 'massive_scan', current_time, verbose=self.verbose_scoring
+            )
+            if alert:
+                return alert
         
         return None
 

@@ -107,7 +107,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_write) {
     struct event_t data = {};
     u64 pid_tgid = bpf_get_current_pid_tgid();
     // filtro >1KB
-    if (args->count < 1024) return 0;
+    if (args->count < 64) return 0;
     data.type = 2;
     data.pid = pid_tgid >> 32;
     data.ppid = get_ppid();
@@ -212,7 +212,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
             u16 port = 0;
             bpf_probe_read(&port, 2, (char*)addr + 2);
             // Guardar puerto en los primeros bytes del filename
-            *(u16*)data.filename = ntohs(port);
+            *(u16*)data.filename = port;
         }
     }
     
@@ -578,8 +578,8 @@ def main():
             print("Compilando eBPF...", file=sys.stderr)
         
         b = BPF(text=BPF_PROGRAM)
-        b["events"].open_perf_buffer(handle_event)
-
+        b["events"].open_perf_buffer(handle_event, page_cnt=128)
+        
         if args.verbose:
             print("✓ eBPF compilado exitosamente", file=sys.stderr)
             print("Monitorizando syscalls (9 tipos activos)...", file=sys.stderr)

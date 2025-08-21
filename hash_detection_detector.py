@@ -123,6 +123,15 @@ class ProcessScoreTracker:
         self.alert_threshold = 6  # Umbral según tu documento
         self.time_window = 10      # Ventana de 10 segundos
         self.alerted_pids = set()  # Anti-spam
+        # Tracking familiar para detectar fork-and-run
+        self.family_scores = defaultdict(lambda: {
+            'pids': set(),
+            'indicators': defaultdict(int),
+            'last_update': 0,
+            'window_start': 0
+        })
+        self.pid_to_family = {}
+        self.alerted_families = set()
         # MITRE ATT&CK Mapping
         self.mitre_mapping = {
             'locked_files_burst': ['T1486'],      # Data Encrypted for Impact
@@ -174,25 +183,107 @@ class ProcessScoreTracker:
         if points > 0:
             proc['window_events'].append((event_time, indicator, points))
             proc['last_update'] = event_time
+
+            # NUEVO: Tracking familiar
+            if hasattr(self.detector, 'process_tree') and self.detector.process_tree.tree:
+                # Buscar PPID del proceso actual
+                ppid = None
+                if pid in self.detector.process_tree.tree:
+                    ppid = self.detector.process_tree.tree[pid].get('ppid')
+                
+                if ppid:
+                    # Usar PPID como ID de familia
+                    family_id = f"family_{ppid}"
+                    family = self.family_scores[family_id]
+                    
+                    # Limpiar ventana familiar
+                    if event_time - family['window_start'] > self.time_window:
+                        family['indicators'].clear()
+                        family['pids'].clear()
+                        family['window_start'] = event_time
+                    
+                    # Acumular en familia
+                    family['indicators'][indicator] += 1
+                    family['pids'].add(pid)
+                    family['last_update'] = event_time
+                    
+                    # Calcular score familiar
+                    family_score = 0
+                    for ind, count in family['indicators'].items():
+                        base_points = self.scoring_rules.get(ind, 0)
+                        # Si hay 5+ del mismo indicador, multiplicar puntos
+                        if count >= 5 and ind == 'chmod_regular':
+                            family_score += 6  # Directo 6 puntos para 5+ chmod
+                        elif count >= 5:
+                            family_score += base_points * 2  # Otros indicadores x2 si hay 5+
+                        elif count >= 3:
+                            family_score += base_points * 1.5  # x1.5 si hay 3-4
+                        else:
+                            family_score += base_points * count  # Normal para 1-2
+                    
+                    # Verificar umbral familiar
+                    
+                    if family_score >= self.alert_threshold and family_id not in self.alerted_families:
+                        self.alerted_families.add(family_id)
+                        indicators_str = ', '.join([f"{ind}(x{cnt})" for ind, cnt in family['indicators'].items()])
+                        mitre_techniques = set()
+                        for ind in family['indicators'].keys():
+                            mitre_techniques.update(self.mitre_mapping.get(ind, []))
+                        mitre_str = f" [MITRE: {', '.join(sorted(mitre_techniques))}]" if mitre_techniques else ""
+                        
+                        alert_msg = f"RANSOMWARE FAMILIAR [SCORE {int(family_score)}]: {indicators_str} ({len(family['pids'])} procesos, parent PID {ppid}){mitre_str}"
+                        
+                        # Llamar al Response Engine con el PPID
+                        if self.detector and hasattr(self.detector, '_execute_response'):
+                            self.detector._execute_response(ppid, int(family_score), "family_parent", alert_msg)
+                        
+                        # Marcar todos los PIDs de la familia como alertados
+                        for fpid in family['pids']:
+                            self.alerted_pids.add(fpid)
+                        
+                        return alert_msg
             
             # DEBUG: Ver qué indicador se detecta
             print(f"DEBUG INDICATOR: {indicator} para PID {pid}", file=sys.stderr)
             
             # Response inmediato para indicadores críticos
+             
             CRITICAL_INDICATORS = {'locked_files_burst', 'unlink_burst', 'massive_write'}
             if indicator in CRITICAL_INDICATORS:
                 print(f"DEBUG: Indicador crítico detectado: {indicator}", file=sys.stderr)
                 if os.environ.get('EDR_RESPONSE_MODE', 'monitor') != 'monitor':
                     print(f"DEBUG: Response mode es: {os.environ.get('EDR_RESPONSE_MODE')}", file=sys.stderr)
                     if pid not in self.alerted_pids:
-                        print(f"DEBUG: Intentando EMERGENCY KILL PID {pid}", file=sys.stderr)
+                        # NUEVO: Verificaciones de seguridad antes de matar
+                        my_pid = os.getpid()
+                        parent_pid = os.getppid()
+                        
+                        # Obtener nombre del proceso si es posible
                         try:
-                            os.kill(pid, 9)  # SIGKILL inmediato
-                            print(f"🔴 EMERGENCY KILL: PID {pid} - {indicator} detectado", file=sys.stderr)
-                            if self.detector and hasattr(self.detector, 'emergency_stopped'):
-                                self.detector.emergency_stopped.add(pid)
-                        except Exception as e:
-                            print(f"DEBUG: Error matando PID {pid}: {e}", file=sys.stderr)
+                            with open(f"/proc/{pid}/comm", 'r') as f:
+                                proc_name = f.read().strip()
+                        except:
+                            proc_name = "unknown"
+                        
+                        # Lista de procesos protegidos
+                        protected_procs = ['python3', 'python', 'sudo', 'bash', 'sh', 'systemd', 'init']
+                        
+                        # Verificar si es seguro matar
+                        if pid == my_pid or pid == parent_pid:
+                            print(f"DEBUG: Evitando auto-kill de PID {pid} (detector/collector)", file=sys.stderr)
+                        elif pid <= 1000:  # Procesos del sistema suelen tener PIDs bajos
+                            print(f"DEBUG: Evitando kill de proceso sistema PID {pid}", file=sys.stderr)
+                        elif proc_name in protected_procs:
+                            print(f"DEBUG: Evitando kill de proceso protegido {proc_name} (PID {pid})", file=sys.stderr)
+                        else:
+                            print(f"DEBUG: Intentando EMERGENCY KILL PID {pid} ({proc_name})", file=sys.stderr)
+                            try:
+                                os.kill(pid, 9)  # SIGKILL inmediato
+                                print(f"🔴 EMERGENCY KILL: PID {pid} ({proc_name}) - {indicator} detectado", file=sys.stderr)
+                                if self.detector and hasattr(self.detector, 'emergency_stopped'):
+                                    self.detector.emergency_stopped.add(pid)
+                            except Exception as e:
+                                print(f"DEBUG: Error matando PID {pid}: {e}", file=sys.stderr)
                     else:
                         print(f"DEBUG: PID {pid} ya estaba en alerted_pids", file=sys.stderr)
             
@@ -596,6 +687,18 @@ class ThreatDetectorFixed:
             # Tracking de process tree
             if event.event_type == "EXEC":
                 self.process_tree.add_process(event.pid, event.ppid, event.comm)
+            
+            # NUEVO: Pasar PPID al score tracker para todos los eventos
+            if hasattr(event, 'ppid') and event.ppid:
+                # Asegurar que el árbol conoce esta relación
+                if event.pid not in self.process_tree.tree:
+                    self.process_tree.tree[event.pid] = {
+                        'ppid': event.ppid,
+                        'exe': event.comm,
+                        'score': 0,
+                        'children': [],
+                        'events': []
+                    }
 
             # DEBUG: Si el evento es WRITE, imprime un mensaje de debug mostrando el PID y los bytes escritos
             if event.event_type == "WRITE":
@@ -700,7 +803,7 @@ class ThreatDetectorFixed:
             if alert_message:
                 # Ejecutar Response Engine si hay score alto
                 # REEMPLAZAR (línea ~450-460 en analyze_event):
-                if "RANSOMWARE [SCORE" in alert_message:
+                if "RANSOMWARE" in alert_message and "[SCORE" in alert_message:
                     import re
                     score_match = re.search(r'\[SCORE (\d+)\]', alert_message)
                     pid_match = re.search(r'\(PID (\d+)\)', alert_message)  # AÑADIR ESTO
@@ -1385,6 +1488,37 @@ class ThreatDetectorFixed:
         Ejecutar respuesta según modo configurado y score
         Retorna True si se ejecutó alguna acción
         """
+        # CASO ESPECIAL: Si el PID es 1 y viene de detección familiar
+        if pid == 1 and "FAMILIAR" in reason:
+            print(f"RESPONSE: Familia huérfana detectada (parent PID 1)", file=sys.stderr)
+            # Extraer PIDs de la familia del mensaje de alerta
+            import re
+            match = re.search(r'\((\d+) procesos', reason)
+            if match and self.score_tracker.family_scores.get('family_1'):
+                family = self.score_tracker.family_scores['family_1']
+                killed_count = 0
+                for child_pid in family['pids']:
+                    if child_pid != os.getpid() and child_pid != os.getppid():
+                        try:
+                            # Verificar que el proceso existe antes de matar
+                            if os.path.exists(f"/proc/{child_pid}"):
+                                os.kill(child_pid, 9)
+                                killed_count += 1
+                                print(f"RESPONSE: Matado hijo huérfano PID {child_pid}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"RESPONSE: Error matando PID {child_pid}: {e}", file=sys.stderr)
+                
+                if killed_count > 0:
+                    self.stats["response_kills"] += killed_count
+                    print(f"RESPONSE: {killed_count} procesos huérfanos eliminados", file=sys.stderr)
+                    return True
+            return False
+        
+        # Protección contra PID <= 1 (pero ya manejamos PID 1 arriba)
+        if pid <= 0:
+            print(f"RESPONSE: Ignorando PID inválido {pid}", file=sys.stderr)
+            return False
+            
         # Revisar si fue detenido de emergencia
         if pid in self.emergency_stopped:
             family_score = self.process_tree.get_family_score(pid)
@@ -1402,8 +1536,8 @@ class ThreatDetectorFixed:
             return False
             
         # No responder a procesos del sistema o al script de testing
-        protected_procs = ['systemd', 'init', 'kernel', 'bash', 'sh', 'testing_sistema']
-        if pid == 1 or comm in protected_procs or 'testing' in comm.lower():
+        protected_procs = ['systemd', 'init', 'kernel', 'bash', 'sh', 'testing_sistema', 'python', 'python3']
+        if comm in protected_procs or 'testing' in comm.lower():
             print(f"RESPONSE: Ignorando proceso protegido {comm} (PID {pid})", file=sys.stderr)
             return False
             
@@ -1452,7 +1586,7 @@ class ThreatDetectorFixed:
             
             child_pids = []
             if result.stdout:
-                child_pids = [int(p) for p in result.stdout.strip().split('\\n') if p]  # Corregido: \\n no \\\\n
+                child_pids = [int(p) for p in result.stdout.strip().split('\n') if p]
             
             all_pids = [pid] + child_pids
             killed_count = 0
@@ -1660,6 +1794,8 @@ class ThreatDetectorFixed:
         print(f"   Umbral configurado: >{self.score_tracker.alert_threshold} puntos", file=sys.stderr)
         print(f"   Ventana temporal: {self.score_tracker.time_window}s", file=sys.stderr)
         print(f"   PIDs que alcanzaron umbral: {len(self.score_tracker.alerted_pids)}", file=sys.stderr)
+        print(f"   Familias que alcanzaron umbral: {len(self.score_tracker.alerted_families)}", file=sys.stderr)
+
         if self.verbose_scoring:
             print(f"   Modo verbose: ACTIVO", file=sys.stderr)
         

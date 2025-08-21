@@ -251,7 +251,7 @@ class ProcessScoreTracker:
             CRITICAL_INDICATORS = {'locked_files_burst', 'unlink_burst', 'massive_write'}
             if indicator in CRITICAL_INDICATORS:
                 print(f"DEBUG: Indicador crítico detectado: {indicator}", file=sys.stderr)
-                if os.environ.get('EDR_RESPONSE_MODE', 'monitor') != 'monitor':
+                if False: #os.environ.get('EDR_RESPONSE_MODE', 'monitor') != 'monitor':
                     print(f"DEBUG: Response mode es: {os.environ.get('EDR_RESPONSE_MODE')}", file=sys.stderr)
                     if pid not in self.alerted_pids:
                         # NUEVO: Verificaciones de seguridad antes de matar
@@ -388,7 +388,9 @@ class ThreatDetectorFixed:
         # Whitelist de procesos de sistema que no vamos a contar porque son seguros
         self.whitelist_procs = {
             "tracker-extract", "tracker-miner-f", "tracker-miner-fs", 
-            "systemd", "kworker", "ksoftirqd", "migration", "rcu_gp", "rcu_par_gp"
+            "systemd", "kworker", "ksoftirqd", "migration", "rcu_gp", "rcu_par_gp",
+            "Web Content", "WebExtensions", "Isolated Web"
+
         }
         
         # ahora sii: Umbrales WRITE REALISTAS para testing
@@ -663,6 +665,16 @@ class ThreatDetectorFixed:
             return None
             
         try:
+            # AÑADIR: Ignorar eventos del propio detector
+            my_pid = os.getpid()
+            event_pid = event_data.get("pid", 0)
+            
+            if event_pid == my_pid:
+                # Es el propio detector, ignorar
+                return None
+            # También ignorar el collector (proceso padre)
+            if event_pid == os.getppid():
+                return None
             #vamos a Crear un objeto Event desde el JSON recibido por stdin
             # Event ahora incluye también el campo bytes_written para eventos de tipo WRITE
             event = Event(

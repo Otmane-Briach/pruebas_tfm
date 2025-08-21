@@ -96,6 +96,9 @@ class ProcessScoreTracker:
             'massive_write': 3,            # >20MB o >50 ops
             'unlink_burst': 3,             # >5 deletes en 10s
             'ransom_note': 3,              # Drop HTML/RTF
+             
+            'directory_scan': 3,        # NUEVO: >100 OPEN en 10s = escaneo masivo
+            'recursive_scan': 2,        # NUEVO: Escaneo de /proc /sys /dev
             
             # +2 PUNTOS: Prevalencia media (50-80%) y especificidad media (2-5% FP)
             'tmp_execution': 2,            # Ejecución desde /tmp
@@ -166,23 +169,32 @@ class ProcessScoreTracker:
                 return None  # Ya existe este indicador, no duplicar
         
         # Añadir nuevo evento
+        # Añadir nuevo evento
         points = self.scoring_rules.get(indicator, 0)
         if points > 0:
             proc['window_events'].append((event_time, indicator, points))
             proc['last_update'] = event_time
             
-            # Response inmediato para indicadores críticos - VA AQUÍ, DENTRO DEL IF
-          # CRITICAL_INDICATORS = {'locked_files_burst', 'unlink_burst', 'massive_write'}
-          #  if indicator in CRITICAL_INDICATORS and os.environ.get('EDR_RESPONSE_MODE', 'monitor') != 'monitor':
-          #      if pid not in self.alerted_pids:
-          #          try:
-          #              os.kill(pid, 19)  # SIGSTOP inmediato
-          #              print(f" EMERGENCY STOP: PID {pid} - {indicator} detectado", file=sys.stderr)
-          #              # Marcar para revisión posterior
-          #              if self.detector and hasattr(self.detector, 'emergency_stopped'):
-          #                  self.detector.emergency_stopped.add(pid)
-           #         except:
-            #            pass
+            # DEBUG: Ver qué indicador se detecta
+            print(f"DEBUG INDICATOR: {indicator} para PID {pid}", file=sys.stderr)
+            
+            # Response inmediato para indicadores críticos
+            CRITICAL_INDICATORS = {'locked_files_burst', 'unlink_burst', 'massive_write'}
+            if indicator in CRITICAL_INDICATORS:
+                print(f"DEBUG: Indicador crítico detectado: {indicator}", file=sys.stderr)
+                if os.environ.get('EDR_RESPONSE_MODE', 'monitor') != 'monitor':
+                    print(f"DEBUG: Response mode es: {os.environ.get('EDR_RESPONSE_MODE')}", file=sys.stderr)
+                    if pid not in self.alerted_pids:
+                        print(f"DEBUG: Intentando EMERGENCY KILL PID {pid}", file=sys.stderr)
+                        try:
+                            os.kill(pid, 9)  # SIGKILL inmediato
+                            print(f"🔴 EMERGENCY KILL: PID {pid} - {indicator} detectado", file=sys.stderr)
+                            if self.detector and hasattr(self.detector, 'emergency_stopped'):
+                                self.detector.emergency_stopped.add(pid)
+                        except Exception as e:
+                            print(f"DEBUG: Error matando PID {pid}: {e}", file=sys.stderr)
+                    else:
+                        print(f"DEBUG: PID {pid} ya estaba en alerted_pids", file=sys.stderr)
             
             # Calcular score actual
             current_score = sum(e[2] for e in proc['window_events'])
@@ -238,8 +250,8 @@ class ThreatDetectorFixed:
         # Response Engine Configuration
         self.response_mode = os.environ.get('EDR_RESPONSE_MODE', 'monitor').lower()
         self.response_thresholds = {
-            'block': 6,   # SIGSTOP para score >= 6
-            'kill': 8     # SIGKILL para score >= 8
+            'block': 4,   # SIGSTOP para score >= 6
+            'kill': 6     # SIGKILL para score >= 8
         }
         self.blocked_pids = set()  # PIDs bloqueados con SIGSTOP
         self.killed_pids = set()   # PIDs terminados con SIGKILL
@@ -250,6 +262,8 @@ class ThreatDetectorFixed:
         # Ventanas para nuevas syscalls
         self.deletion_windows = defaultdict(deque)  # Ventana para UNLINK
         self.chmod_windows = defaultdict(deque)     # Ventana para CHMOD
+        # NUEVA: Ventana para detectar escaneos
+        self.scan_windows = defaultdict(deque)
 
         # Ventanas para detección de persistencia
         self.persistence_windows = defaultdict(deque)
@@ -310,7 +324,7 @@ class ThreatDetectorFixed:
             },
             "suspicious_extensions": {
                 ".locked", ".enc", ".crypt", ".encrypt", ".encrypted",
-                ".vault", ".crypto", ".secure", ".ransomed"
+                ".vault", ".crypto", ".secure", ".ransomed", ".sougolock"  # <-- AÑADIR
             },
 
             # Umbrales para UNLINK
@@ -685,19 +699,32 @@ class ThreatDetectorFixed:
             # Retornar alerta si existe
             if alert_message:
                 # Ejecutar Response Engine si hay score alto
+                # REEMPLAZAR (línea ~450-460 en analyze_event):
                 if "RANSOMWARE [SCORE" in alert_message:
-                    # Extraer score del mensaje
                     import re
                     score_match = re.search(r'\[SCORE (\d+)\]', alert_message)
-                    if score_match:
+                    pid_match = re.search(r'\(PID (\d+)\)', alert_message)  # AÑADIR ESTO
+                    
+                    if score_match and pid_match:
                         score = int(score_match.group(1))
-                        # Solo ejecutar si no es un proceso protegido
-                        if event.comm not in ['bash', 'sh', 'testing_sistema']:
-                            response_executed = self._execute_response(event.pid, score, event.comm, alert_message)
+                        alert_pid = int(pid_match.group(1))  # USAR EL PID DE LA ALERTA
+                        
+                        # Obtener comm del proceso correcto
+                        try:
+                            with open(f"/proc/{alert_pid}/comm", 'r') as f:
+                                alert_comm = f.read().strip()
+                        except:
+                            alert_comm = "unknown"
+                        
+                        # Debug
+                        print(f"DEBUG: Alerta PID {alert_pid} ({alert_comm}), Score {score}", file=sys.stderr)
+                        
+                        if alert_comm not in ['bash', 'sh', 'testing_sistema', 'sudo']:
+                            response_executed = self._execute_response(alert_pid, score, alert_comm, alert_message)
                             if response_executed:
-                                print(f"RESPONSE: Acción tomada contra {event.comm} (PID {event.pid})", file=sys.stderr)
-                
-                return alert_message
+                                print(f"RESPONSE: Acción tomada contra {alert_comm} (PID {alert_pid})", file=sys.stderr)
+
+                    return alert_message
                 
             return None
             
@@ -915,6 +942,12 @@ class ThreatDetectorFixed:
         if alert:
             self.stats["alerts_by_type"]["file_burst"] += 1
             return alert
+        
+        # AÑADIR DESPUÉS:
+        #alert = self._check_directory_scan(event)  # NUEVO
+        #if alert:
+        #    self.stats["alerts_by_type"]["directory_scan"] += 1
+        #    return alert
             
         alert = self._check_exec_burst(event)
         if alert:
@@ -1118,6 +1151,46 @@ class ThreatDetectorFixed:
             self.mass_deletion_alerted.add(pid)
             self.stats["ransomware_deletion_patterns"] += 1
             return f"PATRÓN RANSOMWARE: {user_files_deleted} archivos de usuario borrados (PID {pid}) [MITRE: T1485, T1486]"
+        
+        return None
+
+    def _check_directory_scan(self, event: Event) -> Optional[str]:
+        """
+        Detectar escaneo masivo del filesystem (pre-cifrado)
+        El ransomware escanea TODO antes de cifrar
+        """
+        if event.event_type != "OPEN":
+            return None
+        
+        current_time = event.timestamp
+        pid = event.pid
+        
+        # Actualizar ventana
+        window = self.scan_windows[pid]
+        while window and current_time - window[0] > 10:  # Ventana 10s
+            window.popleft()
+        window.append(current_time)
+        
+        # Si >100 OPEN en 10s = escaneo masivo
+        if len(window) >= 100:
+            alert = self.score_tracker.add_indicator(
+                pid, 'directory_scan', current_time, verbose=self.verbose_scoring
+            )
+            if alert:
+                self.scan_windows[pid].clear()
+                return alert
+        
+        # Detectar escaneo de directorios del sistema
+        if event.path and len(window) >= 50:
+            if any(sys_dir in event.path for sys_dir in ['/proc/', '/sys/', '/dev/']):
+                # Contar cuántos son de sistema
+                system_count = sum(1 for _ in range(min(50, len(window))))
+                if system_count > 30:
+                    alert = self.score_tracker.add_indicator(
+                        pid, 'recursive_scan', current_time, verbose=self.verbose_scoring
+                    )
+                    if alert:
+                        return alert
         
         return None
 
@@ -1346,8 +1419,9 @@ class ThreatDetectorFixed:
         action_taken = False
         
         # KILL MODE: Terminar si score >= umbral kill
+        print(f"DEBUG RESPONSE: mode={self.response_mode}, score={score}, threshold={self.response_thresholds['kill']}", file=sys.stderr)
         if self.response_mode == 'kill' and score >= self.response_thresholds['kill']:
-            if self._kill_process(pid, comm, reason):
+            if self._kill_process_family(pid, comm, reason):
                 self.killed_pids.add(pid)
                 self.stats["response_kills"] += 1
                 action_taken = True
@@ -1364,31 +1438,72 @@ class ThreatDetectorFixed:
                     
         return action_taken
     
-    def _kill_process(self, pid: int, comm: str, reason: str) -> bool:
-        """Terminar proceso con SIGKILL"""
+    def _kill_process_family(self, pid: int, comm: str, reason: str) -> bool:
+        """Matar proceso Y todos sus hijos"""
         try:
-            # Verificar que el proceso existe
+            # Obtener lista de PIDs: padre + hijos
+            import subprocess
+            result = subprocess.run(
+                f"pgrep -P {pid}", 
+                shell=True, 
+                capture_output=True, 
+                text=True
+            )
+            
+            child_pids = []
+            if result.stdout:
+                child_pids = [int(p) for p in result.stdout.strip().split('\\n') if p]  # Corregido: \\n no \\\\n
+            
+            all_pids = [pid] + child_pids
+            killed_count = 0
+            
+            # Matar todos: hijos primero, padre después
+            for target_pid in reversed(all_pids):
+                try:
+                    # Usar sudo kill en lugar de os.kill
+                    kill_result = subprocess.run(
+                        ['sudo', 'kill', '-9', str(target_pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                    if kill_result.returncode == 0:
+                        killed_count += 1
+                        print(f"RESPONSE: Matado PID {target_pid}", file=sys.stderr)
+                except Exception as e:
+                    print(f"RESPONSE: Error matando PID {target_pid}: {e}", file=sys.stderr)
+                    
+            if killed_count > 0:
+                print(f"RESPONSE: Familia de {comm} eliminada: {killed_count} procesos", file=sys.stderr)
+                return True
+                
+        except Exception as e:
+            print(f"RESPONSE ERROR killing family: {e}", file=sys.stderr)
+        
+        return self._kill_process(pid, comm, reason)  # Fallback
+
+    def _kill_process(self, pid: int, comm: str, reason: str) -> bool:
+        """Terminar proceso con SIGKILL usando sudo"""
+        try:
             if not os.path.exists(f"/proc/{pid}"):
                 return False
+            
+            # Usar sudo kill en lugar de os.kill
+            import subprocess
+            result = subprocess.run(
+                ['sudo', 'kill', '-9', str(pid)], 
+                capture_output=True, 
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0:
+                print(f"RESPONSE: Proceso {pid} ({comm}) terminado: {reason}", file=sys.stderr)
+                return True
+            else:
+                print(f"RESPONSE ERROR: {result.stderr}", file=sys.stderr)
+                return False
                 
-            # Verificar que no es proceso root crítico
-            with open(f"/proc/{pid}/status", 'r') as f:
-                status = f.read()
-                if "Uid:\t0\t" in status and comm in ['sshd', 'systemd', 'init']:
-                    print(f"RESPONSE: No matando proceso root crítico {comm}", file=sys.stderr)
-                    return False
-            
-            # Ejecutar kill
-            os.kill(pid, 9)  # SIGKILL
-            print(f"RESPONSE: Proceso {pid} ({comm}) terminado: {reason}", file=sys.stderr)
-            return True
-            
-        except (ProcessLookupError, FileNotFoundError):
-            return False
-        except PermissionError:
-            self.stats["response_failures"] += 1
-            print(f"RESPONSE ERROR: Sin permisos para terminar {pid}", file=sys.stderr)
-            return False
         except Exception as e:
             self.stats["response_failures"] += 1
             print(f"RESPONSE ERROR: {e}", file=sys.stderr)
@@ -1627,7 +1742,7 @@ def main():
                 alert = detector.analyze_event(event)
                 
                 if alert:
-                    print(f"ALERTA: {alert}")
+                    print(f"ALERTA: {alert}", flush=True)
                     sys.stdout.flush()
                 
                 line_count += 1

@@ -93,8 +93,8 @@ class ProcessScoreTracker:
         self.scoring_rules = {
             # +3 PUNTOS: Alta prevalencia (>80%) y especificidad (<2% FP)
             'locked_files_burst': 3,      # >5 archivos .locked en 10s
-            'massive_write': 2,            # >20MB o >50 ops
-            'unlink_burst': 2,             # >5 deletes en 10s
+            'massive_write': 3,            # >20MB o >50 ops
+            'unlink_burst': 3,             # >5 deletes en 10s
             'ransom_note': 3,              # Drop HTML/RTF
              
             'directory_scan': 3,        # NUEVO: >100 OPEN en 10s = escaneo masivo
@@ -114,11 +114,6 @@ class ProcessScoreTracker:
             'mmap_exec': 1,                # mmap WRITE+EXEC
             'ptrace_use': 1,               # ptrace
             'o_trunc': 1,                  # O_TRUNC flag
-
-
-            'modify_without_read': 2,   # Modificar sin leer primero
-            'mass_rename': 2,           # Renombrado masivo
-            'chmod_after_write': 1,     # Cambiar permisos post-escritura
             
             # +1 BONUS: Co-ocurrencia
             'cooccurrence': 1,              # Múltiples indicadores juntos
@@ -219,8 +214,10 @@ class ProcessScoreTracker:
                         # Si hay 5+ del mismo indicador, multiplicar puntos
                         if count >= 5 and ind == 'chmod_regular':
                             family_score += 6  # Directo 6 puntos para 5+ chmod
-                        elif count >= 5 and ind not in ['unlink_burst', 'massive_write']:
+                        elif count >= 5:
                             family_score += base_points * 2  # Otros indicadores x2 si hay 5+
+                        elif count >= 3:
+                            family_score += base_points * 1.5  # x1.5 si hay 3-4
                         else:
                             family_score += base_points * count  # Normal para 1-2
                     
@@ -300,10 +297,10 @@ class ProcessScoreTracker:
             
             # Check co-ocurrencia bonus
             unique_indicators = set(e[1] for e in proc['window_events'])
-            if len(unique_indicators) == 1:
-                single_ind = list(unique_indicators)[0]
-                if single_ind not in ['locked_files_burst', 'ransom_note']:
-                    current_score = min(current_score, 5)
+            if len(unique_indicators) >= 3:
+                current_score += self.scoring_rules['cooccurrence']
+                if verbose:
+                    print(f"  +1 bonus co-ocurrencia → {current_score}/6", file=sys.stderr)
             
             # Verificar umbral
             if current_score >= self.alert_threshold and pid not in self.alerted_pids:
@@ -395,15 +392,6 @@ class ThreatDetectorFixed:
             "Web Content", "WebExtensions", "Isolated Web"
 
         }
-
-        # Tracking de operaciones por archivo
-        self.file_operation_tracker = defaultdict(lambda: defaultdict(lambda: {
-            'first_seen': 0,
-            'reads': 0,
-            'writes': 0,
-            'last_op': None,
-            'renamed_to': None
-        }))
         
         # ahora sii: Umbrales WRITE REALISTAS para testing
         self.config = {
@@ -792,10 +780,6 @@ class ThreatDetectorFixed:
 
             # Actualizar estadísticas mejoradas
             self._update_stats_complete(event)
-
-            # AÑADIR AQUÍ - Limpieza periódica de trackers
-            if self.stats["total_events"] % 100 == 0:
-                self._cleanup_trackers()
             
             # PRIORIDAD MÁXIMA: Hash detection de malware
             alert_level = None
@@ -1128,138 +1112,8 @@ class ThreatDetectorFixed:
             self.stats["alerts_by_type"]["persistence"] += 1
             return alert
 
-        # NUEVAS DETECCIONES COMPORTAMENTALES
-        alert = self._check_write_without_read(event)
-        if alert:
-            self.stats["alerts_by_type"]["write_without_read"] += 1
-            return alert
-        
-        alert = self._check_mass_rename(event)
-        if alert:
-            self.stats["alerts_by_type"]["mass_rename"] += 1
-            return alert
-        
-        alert = self._check_chmod_after_write(event)
-        if alert:
-            self.stats["alerts_by_type"]["chmod_after_write"] += 1
-            return alert
-
         return None
     
-    def _check_write_without_read(self, event: Event) -> Optional[str]:
-        """Detectar archivos modificados sin ser leídos primero"""
-        if event.event_type not in ["OPEN", "WRITE"]:
-            return None
-        
-        if not event.path:
-            return None
-        
-        pid = event.pid
-        file_info = self.file_operation_tracker[pid][event.path]
-        
-        # Actualizar tracking
-        if event.event_type == "OPEN":
-            if not file_info['first_seen']:
-                file_info['first_seen'] = event.timestamp
-            
-            # Verificar si es lectura o escritura
-            if event.flags and (event.flags & 0x1 or event.flags & 0x2):  # WRITE flags
-                file_info['writes'] += 1
-            else:  # READ
-                file_info['reads'] += 1
-                
-        elif event.event_type == "WRITE":
-            file_info['writes'] += 1
-        
-        file_info['last_op'] = event.event_type
-        
-        # Cada 10 archivos, verificar ratio
-        if len(self.file_operation_tracker[pid]) % 10 == 0:
-            suspicious_files = 0
-            for path, ops in self.file_operation_tracker[pid].items():
-                # Archivo modificado sin leer
-                if ops['writes'] > 0 and ops['reads'] == 0:
-                    suspicious_files += 1
-            
-            if suspicious_files >= 8:  # 80% de archivos modificados sin leer
-                # Limpiar tracker para evitar memoria infinita
-                old_files = [p for p, o in self.file_operation_tracker[pid].items() 
-                            if event.timestamp - o['first_seen'] > 60]
-                for p in old_files:
-                    del self.file_operation_tracker[pid][p]
-                
-                # Añadir indicador
-                alert = self.score_tracker.add_indicator(
-                    pid, 'modify_without_read', event.timestamp, verbose=self.verbose_scoring
-                )
-                if alert:
-                    return alert
-        
-        return None
-    
-    def _check_mass_rename(self, event: Event) -> Optional[str]:
-        """Detectar patrones de renombrado masivo (típico de ransomware)"""
-        if event.event_type != "UNLINK":
-            return None
-        
-        if not event.path:
-            return None
-        
-        pid = event.pid
-        
-        # Detectar patrón: archivo.txt → archivo.txt.locked
-        # Se manifiesta como UNLINK del original + OPEN/WRITE del nuevo
-        base_name = os.path.splitext(event.path)[0]
-        
-        # Verificar si recientemente se creó un archivo con el mismo base + extensión extra
-        for other_path in self.file_operation_tracker[pid].keys():
-            if other_path.startswith(base_name) and other_path != event.path:
-                # Posible renombrado
-                self.file_operation_tracker[pid][event.path]['renamed_to'] = other_path
-                
-                # Contar renombrados en ventana de tiempo
-                rename_count = sum(1 for p, info in self.file_operation_tracker[pid].items() 
-                                if info.get('renamed_to') and 
-                                event.timestamp - info['first_seen'] < 30)
-                
-                if rename_count >= 5:
-                    alert = self.score_tracker.add_indicator(
-                        pid, 'mass_rename', event.timestamp, verbose=self.verbose_scoring
-                    )
-                    if alert:
-                        return alert
-        
-        return None
-
-    def _check_chmod_after_write(self, event: Event) -> Optional[str]:
-        """Detectar cambios de permisos después de escribir (ocultar tracks)"""
-        if event.event_type != "CHMOD":
-            return None
-        
-        if not event.path:
-            return None
-        
-        pid = event.pid
-        file_info = self.file_operation_tracker[pid].get(event.path, {})
-        
-        # Si el archivo fue escrito recientemente
-        if file_info.get('writes', 0) > 0:
-            time_since_write = event.timestamp - file_info.get('first_seen', 0)
-            
-            if time_since_write < 5:  # chmod dentro de 5 segundos después de escribir
-                # Especialmente sospechoso si es chmod restrictivo
-                if hasattr(event, 'mode') and event.mode:
-                    # Permisos muy restrictivos después de escribir
-                    if (event.mode & 0o777) in [0o400, 0o600]:  # Read-only
-                        alert = self.score_tracker.add_indicator(
-                            pid, 'chmod_after_write', event.timestamp, verbose=self.verbose_scoring
-                        )
-                        if alert:
-                            return alert
-        
-        return None
-
-
     # MANTENER TODAS LAS FUNCIONES EXISTENTES SIN CAMBIOS
     def _check_suspicious_process(self, event: Event) -> bool:
         """Detección de procesos sospechosos"""
@@ -1830,19 +1684,6 @@ class ThreatDetectorFixed:
             return True
         except:
             return False
-    def _cleanup_trackers(self):
-        """Limpiar trackers antiguos cada 100 eventos"""
-        if self.stats["total_events"] % 100 == 0:
-            current_time = time.time()
-            # Limpiar file_operation_tracker
-            for pid in list(self.file_operation_tracker.keys()):
-                old_files = [p for p, info in self.file_operation_tracker[pid].items()
-                            if current_time - info['first_seen'] > 120]  # 2 minutos
-                for p in old_files:
-                    del self.file_operation_tracker[pid][p]
-                # Si el PID no tiene más archivos, eliminarlo
-                if not self.file_operation_tracker[pid]:
-                    del self.file_operation_tracker[pid]
         
     def print_stats(self):
         """Mostrar estadísticas en tiempo real con DEBUG WRITE"""

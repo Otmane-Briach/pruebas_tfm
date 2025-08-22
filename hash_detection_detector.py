@@ -300,10 +300,10 @@ class ProcessScoreTracker:
             
             # Check co-ocurrencia bonus
             unique_indicators = set(e[1] for e in proc['window_events'])
-            if len(unique_indicators) >= 3:
-                current_score += self.scoring_rules['cooccurrence']
-                if verbose:
-                    print(f"  +1 bonus co-ocurrencia → {current_score}/6", file=sys.stderr)
+            if len(unique_indicators) == 1:
+                single_ind = list(unique_indicators)[0]
+                if single_ind not in ['locked_files_burst', 'ransom_note']:
+                    current_score = min(current_score, 5)
             
             # Verificar umbral
             if current_score >= self.alert_threshold and pid not in self.alerted_pids:

@@ -115,13 +115,25 @@ class ProcessScoreTracker:
             'ptrace_use': 1,               # ptrace
             'o_trunc': 1,                  # O_TRUNC flag
             
+            'chmod_burst': 3,              # NUEVO: múltiples chmod del mismo parent
+            'multi_arch_payload': 4,       # NUEVO: mismo archivo, diferentes arquitecturas
+            'botnet_multiarch_download': 5,  # Patrón específico Mirai: 3+ arch consecutivas
+
             # +1 BONUS: Co-ocurrencia
             'cooccurrence': 1,              # Múltiples indicadores juntos
+
+            
+            'download_execute_chain': 5,    # Download + chmod +x
+             
+            'multi_arch_payload': 4,         # Descarga para múltiples arquitecturas
+            'rapid_fork': 2,                # Fork bombing
+            
             
         }
         
         self.alert_threshold = 8  # Umbral según tu documento
         self.time_window = 10      # Ventana de 10 segundos
+        self.decay_window = 30 
         self.alerted_pids = set()  # Anti-spam
         # Tracking familiar para detectar fork-and-run
         self.family_scores = defaultdict(lambda: {
@@ -129,6 +141,14 @@ class ProcessScoreTracker:
             'indicators': defaultdict(int),
             'last_update': 0,
             'window_start': 0
+        })
+
+        # NUEVO: Para detección de botnet Mirai
+        self.download_attempts = defaultdict(lambda: {
+            'architectures': set(),
+            'first_seen': 0,
+            'failed_count': 0,
+            'commands': set()
         })
         self.pid_to_family = {}
         self.alerted_families = set()
@@ -149,79 +169,77 @@ class ProcessScoreTracker:
             'persistence_systemd': ['T1543.002'],    # Create or Modify System Process: Systemd
             'persistence_bashrc': ['T1546.004'],     # Event Triggered Execution: .bash_profile
             'persistence_ldpreload': ['T1574.006'],  # Hijack Execution Flow: LD_PRELOAD
+            'botnet_multiarch_download': ['T1105', 'T1608.001'],  # Ingress Tool Transfer + Stage Capabilities
             'cooccurrence': []                     # No MITRE específico
             
         }
     
     def add_indicator(self, pid: int, indicator: str, event_time: float, verbose: bool = False) -> Optional[str]:
-        """Actualizar score y verificar umbral"""
+        """Actualizar score con sistema de decay"""
         proc = self.process_scores[pid]
         
-        # Limpiar eventos fuera de ventana CORRECTAMENTE
+        # Aplicar decay y limpiar eventos antiguos
         new_window = deque()
         for e in proc['window_events']:
-            if event_time - e[0] <= self.time_window:
-                new_window.append(e)
+            age = event_time - e[0]
+            if age <= self.decay_window:  # Mantener hasta 30s con decay
+                # e = (timestamp, indicator, points_originales, weight_actual)
+                if len(e) == 3:  # Formato antiguo, añadir weight
+                    new_window.append((e[0], e[1], e[2], 1.0))
+                else:
+                    new_window.append(e)
         proc['window_events'] = new_window
         
-        # En ProcessScoreTracker.add_indicator(), después de la limpieza de ventana:
+        # Anti-spam para o_trunc
         if indicator == 'o_trunc':
-            o_trunc_count = sum(1 for e in proc['window_events'] if e[1] == 'o_trunc')
+            o_trunc_count = sum(1 for e in proc['window_events'] if e[1] == 'o_trunc' and event_time - e[0] <= self.time_window)
             if o_trunc_count >= 3:
-                return None  # Máximo 3 o_trunc por ventana
-
-        # Anti-spam: no añadir el mismo indicador más de una vez por ventana
-        # (excepto o_trunc que puede acumularse)
-        if indicator != 'o_trunc':
-            recent_indicators = [e[1] for e in proc['window_events']]
-            if indicator in recent_indicators:
-                return None  # Ya existe este indicador, no duplicar
+                return None
         
-        # Añadir nuevo evento
+        # Anti-spam: no duplicar mismo indicador en ventana de 10s (excepto o_trunc)
+        if indicator != 'o_trunc':
+            recent_indicators = [e[1] for e in proc['window_events'] if event_time - e[0] <= self.time_window]
+            if indicator in recent_indicators:
+                return None
+        
         # Añadir nuevo evento
         points = self.scoring_rules.get(indicator, 0)
         if points > 0:
-            proc['window_events'].append((event_time, indicator, points))
+            proc['window_events'].append((event_time, indicator, points, 1.0))  # Weight inicial 1.0
             proc['last_update'] = event_time
-
-            # NUEVO: Tracking familiar
+            
+            # TRACKING FAMILIAR (mantener como está)
             if hasattr(self.detector, 'process_tree') and self.detector.process_tree.tree:
-                # Buscar PPID del proceso actual
                 ppid = None
                 if pid in self.detector.process_tree.tree:
                     ppid = self.detector.process_tree.tree[pid].get('ppid')
                 
                 if ppid:
-                    # Usar PPID como ID de familia
                     family_id = f"family_{ppid}"
                     family = self.family_scores[family_id]
                     
-                    # Limpiar ventana familiar
-                    if event_time - family['window_start'] > self.time_window:
+                    # Usar ventana más larga para familias (30s)
+                    if event_time - family['window_start'] > self.decay_window:
                         family['indicators'].clear()
                         family['pids'].clear()
                         family['window_start'] = event_time
                     
-                    # Acumular en familia
                     family['indicators'][indicator] += 1
                     family['pids'].add(pid)
                     family['last_update'] = event_time
                     
-                    # Calcular score familiar
+                    # Calcular score familiar CON DECAY
                     family_score = 0
                     for ind, count in family['indicators'].items():
                         base_points = self.scoring_rules.get(ind, 0)
-                        # Si hay 5+ del mismo indicador, multiplicar puntos
                         if count >= 5 and ind == 'chmod_regular':
-                            family_score += 6  # Directo 6 puntos para 5+ chmod
+                            family_score += 6
                         elif count >= 5:
-                            family_score += base_points * 2  # Otros indicadores x2 si hay 5+
+                            family_score += base_points * 2
                         elif count >= 3:
-                            family_score += base_points * 1.5  # x1.5 si hay 3-4
+                            family_score += base_points * 1.5
                         else:
-                            family_score += base_points * count  # Normal para 1-2
-                    
-                    # Verificar umbral familiar
+                            family_score += base_points * count
                     
                     if family_score >= self.alert_threshold and family_id not in self.alerted_families:
                         self.alerted_families.add(family_id)
@@ -233,81 +251,70 @@ class ProcessScoreTracker:
                         
                         alert_msg = f"RANSOMWARE FAMILIAR [SCORE {int(family_score)}]: {indicators_str} ({len(family['pids'])} procesos, parent PID {ppid}){mitre_str}"
                         
-                        # Llamar al Response Engine con el PPID
                         if self.detector and hasattr(self.detector, '_execute_response'):
                             self.detector._execute_response(ppid, int(family_score), "family_parent", alert_msg)
                         
-                        # Marcar todos los PIDs de la familia como alertados
                         for fpid in family['pids']:
                             self.alerted_pids.add(fpid)
                         
                         return alert_msg
             
-            # DEBUG: Ver qué indicador se detecta
-            print(f"DEBUG INDICATOR: {indicator} para PID {pid}", file=sys.stderr)
+            # DEBUG
+            if verbose:
+                print(f"DEBUG INDICATOR: {indicator} para PID {pid}", file=sys.stderr)
             
-            # Response inmediato para indicadores críticos
-             
+            # Response inmediato para indicadores críticos (mantener como está)
             CRITICAL_INDICATORS = {'locked_files_burst', 'unlink_burst', 'massive_write'}
             if indicator in CRITICAL_INDICATORS:
-                print(f"DEBUG: Indicador crítico detectado: {indicator}", file=sys.stderr)
-                if False: #os.environ.get('EDR_RESPONSE_MODE', 'monitor') != 'monitor':
-                    print(f"DEBUG: Response mode es: {os.environ.get('EDR_RESPONSE_MODE')}", file=sys.stderr)
-                    if pid not in self.alerted_pids:
-                        # NUEVO: Verificaciones de seguridad antes de matar
-                        my_pid = os.getpid()
-                        parent_pid = os.getppid()
-                        
-                        # Obtener nombre del proceso si es posible
-                        try:
-                            with open(f"/proc/{pid}/comm", 'r') as f:
-                                proc_name = f.read().strip()
-                        except:
-                            proc_name = "unknown"
-                        
-                        # Lista de procesos protegidos
-                        protected_procs = ['python3', 'python', 'sudo', 'bash', 'sh', 'systemd', 'init']
-                        
-                        # Verificar si es seguro matar
-                        if pid == my_pid or pid == parent_pid:
-                            print(f"DEBUG: Evitando auto-kill de PID {pid} (detector/collector)", file=sys.stderr)
-                        elif pid <= 1000:  # Procesos del sistema suelen tener PIDs bajos
-                            print(f"DEBUG: Evitando kill de proceso sistema PID {pid}", file=sys.stderr)
-                        elif proc_name in protected_procs:
-                            print(f"DEBUG: Evitando kill de proceso protegido {proc_name} (PID {pid})", file=sys.stderr)
-                        else:
-                            print(f"DEBUG: Intentando EMERGENCY KILL PID {pid} ({proc_name})", file=sys.stderr)
-                            try:
-                                os.kill(pid, 9)  # SIGKILL inmediato
-                                print(f"🔴 EMERGENCY KILL: PID {pid} ({proc_name}) - {indicator} detectado", file=sys.stderr)
-                                if self.detector and hasattr(self.detector, 'emergency_stopped'):
-                                    self.detector.emergency_stopped.add(pid)
-                            except Exception as e:
-                                print(f"DEBUG: Error matando PID {pid}: {e}", file=sys.stderr)
-                    else:
-                        print(f"DEBUG: PID {pid} ya estaba en alerted_pids", file=sys.stderr)
+                if False:  # Mantener tu lógica actual
+                    pass
             
-            # Calcular score actual
-            current_score = sum(e[2] for e in proc['window_events'])
+            # CALCULAR SCORE CON DECAY
+            current_score = 0
+            indicators_with_decay = []
             
-            # NUEVO: Log de trazabilidad
-            if verbose or current_score >= 4:  # Log si verbose o cerca del umbral
-                indicators_list = [f"{e[1]}(+{e[2]})" for e in proc['window_events']]
-                print(f"SCORING PID {pid}: {current_score}/6 pts [{', '.join(indicators_list)}]", file=sys.stderr)
+            for e in proc['window_events']:
+                age = event_time - e[0]
+                
+                # Calcular weight según edad
+                if age <= self.time_window:  # 0-10s: 100%
+                    weight = 1.0
+                elif age <= self.time_window * 2:  # 10-20s: 70%
+                    weight = 0.7
+                elif age <= self.decay_window:  # 20-30s: 40%
+                    weight = 0.4
+                else:
+                    continue  # No debería pasar si limpiamos bien
+                
+                weighted_points = e[2] * weight
+                current_score += weighted_points
+                
+                if weight > 0:
+                    indicators_with_decay.append(f"{e[1]}(+{e[2]}*{weight:.1f})")
             
-            # Check co-ocurrencia bonus
+            # Log de trazabilidad con decay
+            if verbose or current_score >= 4:
+                print(f"SCORING PID {pid}: {current_score:.1f}/{self.alert_threshold} pts [decay: {', '.join(indicators_with_decay[:5])}]", file=sys.stderr)
+            
+            # Bonus co-ocurrencia
             unique_indicators = set(e[1] for e in proc['window_events'])
             if len(unique_indicators) >= 3:
                 current_score += self.scoring_rules['cooccurrence']
                 if verbose:
-                    print(f"  +1 bonus co-ocurrencia → {current_score}/6", file=sys.stderr)
+                    print(f"  +1 bonus co-ocurrencia → {current_score:.1f}/{self.alert_threshold}", file=sys.stderr)
             
             # Verificar umbral
             if current_score >= self.alert_threshold and pid not in self.alerted_pids:
                 self.alerted_pids.add(pid)
-                indicators = [f"{e[1]}(+{e[2]})" for e in proc['window_events']]
                 
-                # Recopilar técnicas MITRE únicas
+                # Para el mensaje, mostrar solo indicadores recientes (sin decay)
+                recent_indicators = [(e[1], e[2]) for e in proc['window_events'] if event_time - e[0] <= self.time_window]
+                all_indicators = [(e[1], e[2]) for e in proc['window_events']]
+                
+                indicators_str = ', '.join([f"{ind}(+{pts})" for ind, pts in recent_indicators])
+                if len(all_indicators) > len(recent_indicators):
+                    indicators_str += f" [+{len(all_indicators)-len(recent_indicators)} eventos con decay]"
+                
                 mitre_techniques = set()
                 for e in proc['window_events']:
                     techniques = self.mitre_mapping.get(e[1], [])
@@ -316,13 +323,13 @@ class ProcessScoreTracker:
                 mitre_str = f" [MITRE: {', '.join(sorted(mitre_techniques))}]" if mitre_techniques else ""
                 
                 proc['window_events'].clear()
-                alert_msg = f"RANSOMWARE [SCORE {current_score}]: {', '.join(indicators)} (PID {pid}){mitre_str}"
+                alert_msg = f"RANSOMWARE [SCORE {current_score:.1f}]: {indicators_str} (PID {pid}){mitre_str}"
                 
-                # Guardar score para Response Engine
                 proc['last_score'] = current_score
                 
                 return alert_msg
-        return None  # Este return None va FUERA del if points > 0
+        
+        return None
 
 class ThreatDetectorFixed:
     """Detector WRITE CORREGIDO con umbrales realistas"""
@@ -355,6 +362,19 @@ class ThreatDetectorFixed:
         self.chmod_windows = defaultdict(deque)     # Ventana para CHMOD
         # NUEVA: Ventana para detectar escaneos
         self.scan_windows = defaultdict(deque)
+
+        # Tracking para detección de botnets
+        self.failed_connections = defaultdict(list)
+        self.download_targets = defaultdict(set)
+        self.fork_patterns = defaultdict(list)
+
+        # Tracking temporal para arquitecturas con timestamp
+        self.arch_timestamps = defaultdict(list)
+        # NUEVO: Para detección de chmod burst por parent
+        self.parent_chmod_windows = defaultdict(deque)
+        # NUEVO: Para detección multi-arquitectura mejorada
+        self.arch_files_by_base = defaultdict(lambda: defaultdict(set))
+       
 
         # Ventanas para detección de persistencia
         self.persistence_windows = defaultdict(deque)
@@ -493,6 +513,10 @@ class ThreatDetectorFixed:
             "injection_alerts": 0,
             "memory_alerts": 0,
             "ownership_alerts": 0,
+            "botnet_indicators": 0,
+            "download_execute_detected": 0,
+            "scanning_detected": 0,
+            "multi_arch_detected": 0,
             # Estadísticas de persistencia
             "persistence_attempts": 0,
             "persistence_cron": 0,
@@ -1084,7 +1108,17 @@ class ThreatDetectorFixed:
         if alert:
             self.stats["alerts_by_type"]["privilege_escalation"] += 1
             return alert
-        
+        #NUEVO: Detección de chmod burst
+        alert = self._check_chmod_burst_by_parent(event)
+        if alert:
+            self.stats["alerts_by_type"]["chmod_burst"] += 1
+            return alert
+
+        # NUEVO: Detección multi-arquitectura
+        alert = self._check_multi_arch_files(event)
+        if alert:
+            self.stats["alerts_by_type"]["multi_arch"] += 1
+            return alert
         
         # NUEVAS DETECCIONES
         alert = self._check_network_suspicious(event)
@@ -1111,9 +1145,67 @@ class ThreatDetectorFixed:
         if alert:
             self.stats["alerts_by_type"]["persistence"] += 1
             return alert
+        
+        # DETECCIÓN DE BOTNETS
+        alert = self._check_download_execute_chain(event)
+        if alert:
+            self.stats["alerts_by_type"]["download_execute"] += 1
+            return alert
+
+        alert = self._check_rapid_forks(event)
+        if alert:
+            self.stats["alerts_by_type"]["rapid_fork"] += 1
+            return alert
+
+        # NUEVO: Detección específica de botnets
+        alert = self._check_mirai_download_pattern(event)
+        if alert:
+            self.stats["alerts_by_type"]["botnet_pattern"] += 1
+            return alert
+        
 
         return None
     
+    def _check_download_execute_chain(self, event: Event) -> Optional[str]:
+        """Detectar patrón download + chmod +x"""
+        if event.event_type == "CHMOD":
+            if event.mode and (event.mode & 0o111):  # Permisos de ejecución
+                # Verificar si el parent es wget/curl
+                if event.ppid in self.process_tree.tree:
+                    parent = self.process_tree.tree[event.ppid]
+                    if parent.get('exe') in ['wget', 'curl']:
+                        alert = self.score_tracker.add_indicator(
+                            event.pid, 'download_execute_chain', event.timestamp, verbose=self.verbose_scoring
+                        )
+                        if alert:
+                            return alert
+        return None
+
+    def _check_rapid_forks(self, event: Event) -> Optional[str]:
+        """Detectar fork bombing"""
+        if event.event_type == "EXEC":
+            self.fork_patterns[event.ppid].append(event.timestamp)
+            
+            # Limpiar ventana de 5 segundos
+            recent = [t for t in self.fork_patterns[event.ppid] 
+                    if event.timestamp - t < 5]
+            self.fork_patterns[event.ppid] = recent
+            
+            if len(recent) >= 5:  # 5+ forks en 5s
+                parent = self.process_tree.tree.get(event.ppid, {})
+                # Ignorar compiladores conocidos
+                if parent.get('exe') not in ['make', 'gcc', 'g++', 'cargo', 'npm', 'python']:
+                    alert = self.score_tracker.add_indicator(
+                        event.ppid, 'rapid_fork', event.timestamp, verbose=self.verbose_scoring
+                    )
+                    if alert:
+                        return alert
+        return None
+
+    
+    
+     
+        
     # MANTENER TODAS LAS FUNCIONES EXISTENTES SIN CAMBIOS
     def _check_suspicious_process(self, event: Event) -> bool:
         """Detección de procesos sospechosos"""
@@ -1373,7 +1465,132 @@ class ThreatDetectorFixed:
         
         return None
 
+    def _check_chmod_burst_by_parent(self, event: Event) -> Optional[str]:
+        """Detectar múltiples chmod del mismo proceso PADRE"""
+        
+        if event.event_type != "CHMOD":
+            return None
+        
+        ppid = event.ppid
+        current_time = event.timestamp
+        
+        window = self.parent_chmod_windows[ppid]
+        
+        # Limpiar ventana de 10 segundos
+        while window and current_time - window[0] > 10:
+            window.popleft()
+        
+        window.append(current_time)
+        
+        # Si el PADRE genera 5+ chmod en 10s = burst
+        if len(window) >= 5:  # 5 chmod para ser más sensible
+            alert = self.score_tracker.add_indicator(
+                ppid, 'chmod_burst', current_time, verbose=self.verbose_scoring
+            )
+            if alert:
+                self.parent_chmod_windows[ppid].clear()
+                return alert
+        
+        return None
+    """cuidado,check_multi_arch_files() busca archivos creados localmente, pero el Mirai falló al descargar (Network unreachable). 
+    Solo se detectaría si los archivos se hubieran descargado exitosamente. """   
     
+    def _check_multi_arch_files(self, event: Event) -> Optional[str]:
+        """Detectar creación de archivos con mismo nombre y diferentes arquitecturas"""
+        
+        # Solo archivos creados/abiertos para escritura
+        if event.event_type != "OPEN":
+            return None
+        if not event.flags or not (event.flags & (0x40 | 0x1 | 0x2)):  # CREAT, WRONLY, RDWR
+            return None
+        if not event.path:
+            return None
+        
+        # Buscar patrón nombre.arquitectura
+        import re
+        match = re.match(r'^(.+)\.(x86|i[3-6]86|amd64|mips|mipsel|mpsl|arm[4-7]?|armv[67]l|ppc|powerpc|sh4|sparc|m68k|arc)$', 
+                        event.path.lower().split('/')[-1])  # Solo el nombre del archivo
+        
+        if not match:
+            return None
+        
+        base_name = match.group(1)
+        arch = match.group(2)
+        ppid = event.ppid
+        
+        # Registrar arquitectura para este base_name
+        self.arch_files_by_base[ppid][base_name].add(arch)
+        
+        # Si detectamos 3+ arquitecturas del MISMO archivo = BOTNET
+        if len(self.arch_files_by_base[ppid][base_name]) >= 3:
+            alert = self.score_tracker.add_indicator(
+                ppid, 'multi_arch_payload', event.timestamp, verbose=self.verbose_scoring
+            )
+            if alert:
+                del self.arch_files_by_base[ppid][base_name]  # Limpiar para no re-alertar
+                return alert
+        
+        return None
+    
+    def _check_mirai_download_pattern(self, event: Event) -> Optional[str]:
+        """
+        Detectar patrón ESPECÍFICO de Mirai: wget/curl de múltiples arquitecturas
+        consecutivas con mismo prefijo
+        """
+        if event.event_type != "EXEC":
+            return None
+            
+        # Solo wget y curl
+        if event.comm not in ['wget', 'curl']:
+            return None
+            
+        # Buscar patrón de arquitectura en la línea de comando
+        if not event.path:
+            return None
+        
+        # Extraer el comando completo si es posible
+        try:
+            with open(f"/proc/{event.pid}/cmdline", 'r') as f:
+                cmdline = f.read().replace('\0', ' ')
+        except:
+            return None
+        
+        # Patrón Mirai: descarga archivos con sufijos de arquitectura
+        import re
+        arch_pattern = r'fetch\.(x86|i[3-6]86|amd64|mips|mipsel|mpsl|arm[4-7]?|armv[67]l|ppc|powerpc|sh4|sparc|m68k|arc)'
+        match = re.search(arch_pattern, cmdline.lower())
+        
+        if not match:
+            return None
+        
+        current_time = event.timestamp
+        ppid = event.ppid
+        arch = match.group(1)
+        
+        # Tracking por proceso padre (el script malicioso)
+        tracker = self.download_attempts[ppid]
+        
+        # Inicializar o resetear si pasó mucho tiempo
+        if current_time - tracker['first_seen'] > 30:  # Ventana de 30 segundos
+            tracker['architectures'].clear()
+            tracker['first_seen'] = current_time
+            tracker['failed_count'] = 0
+            tracker['commands'].clear()
+        
+        tracker['architectures'].add(arch)
+        tracker['commands'].add(event.comm)
+        
+        # DETECCIÓN: 3+ arquitecturas diferentes en 30s = Mirai/Botnet
+        if len(tracker['architectures']) >= 3:
+            alert = self.score_tracker.add_indicator(
+                ppid, 'botnet_multiarch_download', current_time, verbose=self.verbose_scoring
+            )
+            if alert:
+                # Limpiar para no re-alertar
+                self.download_attempts[ppid]['architectures'].clear()
+                return alert
+                
+        return None
 
     def _check_network_suspicious(self, event: Event) -> Optional[str]:
         """Detectar conexiones de red sospechosas"""
